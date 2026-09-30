@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Model and thinking are overridable profile defaults.** Explicit caller choices win independently across Agent, nested delegation, workflows and RPC; tool/permission restrictions remain unchanged. Unsupported explicit effort (including `off` when the selected model cannot disable reasoning) fails before session creation, and resumes reject configuration overrides while preserving recorded model/effort.
+
 ## [0.19.0] - 2026-08-25
 
 > **⚠️ Breaking — this release requires pi 0.84.0 or newer** (`peerDependencies` moves from `>=0.81.0`). `SubagentWorkflow` needs two host APIs that do not exist below it, and both fail the typecheck rather than degrading quietly — see the `Changed` entry below for which, and why neither was worth reimplementing to hold the old floor. npm flags an older pi at install time.
