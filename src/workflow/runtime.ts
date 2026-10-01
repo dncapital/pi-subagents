@@ -15,6 +15,9 @@
 
 import { cpus } from "node:os";
 import { Worker } from "node:worker_threads";
+import { immutableSnapshot } from "../task-assignment.js";
+import type { TaskProjection } from "../task-plan.js";
+import type { AgentReceipt, AgentTaskMetadata, Immutable, TaskAssignment } from "../types.js";
 import { type JournalKeyInput, journalKey, type WorkflowJournalEntry } from "./journal.js";
 import { type CompiledSchema, compileJsonSchema } from "./json-schema.js";
 import { extractMeta, type WorkflowMeta } from "./meta.js";
@@ -23,6 +26,9 @@ import { WORKER_SOURCE } from "./worker-source.js";
 
 /** Matches the `script` field's `maxLength` in the tool schema. */
 export const MAX_SCRIPT_LENGTH = 524_288;
+
+/** Task-only shutdown bound; timeout retains ownership, it never proves release. */
+export const TASK_SETTLEMENT_TIMEOUT_MS = 3_000;
 
 /** Agents one run may schedule, in total. */
 export const WORKFLOW_AGENT_CAP = 1000;
@@ -57,6 +63,8 @@ export interface WorkflowSpawnRequest {
   prompt: string;
   label: string;
   agentType: string;
+  taskAssignment?: Immutable<TaskAssignment>;
+  cwd?: string;
   model?: string;
   /**
    * Reasoning effort for this child, as one of pi's thinking levels.
@@ -120,12 +128,14 @@ export interface WorkflowSpawnRequest {
   gate?: string;
 }
 
-export interface WorkflowSpawnResult {
+export interface WorkflowSpawnResult extends Partial<AgentTaskMetadata> {
   ok: boolean;
   /** The agent's answer. Present when `ok`. */
   text?: string;
   /** Why it failed. Present when not `ok`. */
   error?: string;
+  /** Cleanup warning, independent of the child's answer and success status. */
+  sessionCleanupError?: string;
   /** The user dismissed it rather than it failing; renders as skipped. */
   skipped?: boolean;
   tokens?: number;
@@ -182,6 +192,14 @@ export type WorkflowScriptSource =
   | { ok: false; message: string };
 
 export interface WorkflowHost {
+  /** Opt-in retained-task facade only; ordinary hosts expose neither hook. */
+  taskCall?(method: string, payload: unknown): Promise<unknown>;
+  taskProjection?(): Immutable<TaskProjection>;
+  /** Stop an unanswered facade check when the worker finishes/aborts. */
+  cancelTaskCall?(): void;
+  /** Actual owned operation drain has finished; verify current SDK settlement. */
+  settleTaskEffects?(): void;
+  taskSettlementFailed?(error: string): void;
   spawnAgent(request: WorkflowSpawnRequest): Promise<WorkflowSpawnResult>;
   /** Called for every in-flight agent when the run aborts. */
   abortAgent(agentId: string): void;
@@ -205,6 +223,7 @@ export interface WorkflowHost {
      * the row above it shows the one that ran.
      */
     onResolved?: WorkflowSpawnRequest["onResolved"],
+    taskAssignment?: Immutable<TaskAssignment>,
   ): Promise<WorkflowSpawnResult>;
   /**
    * Run a `gate` command and report whether it passed.
@@ -322,6 +341,9 @@ export interface WorkflowRunResult {
   agentCount: number;
   /** How many of those came back from the journal instead of being spawned. */
   replayedCount: number;
+  /** Host-only immutable evidence; agent() still returns text/schema/null. */
+  receipts?: readonly Immutable<AgentReceipt>[];
+  taskProjection?: Immutable<TaskProjection>;
 }
 
 /* ------------------------------------------------------------------------- *
@@ -433,6 +455,8 @@ interface AgentCallPayload {
   label?: string;
   model?: string;
   agentType?: string;
+  taskAssignment?: Immutable<TaskAssignment>;
+  cwd?: string;
   isolation?: "worktree";
   phaseIndex?: number;
   phaseTitle?: string;
@@ -586,6 +610,9 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   const { script, host } = options;
 
   assertBoundarySafe(options.args, "args");
+  if (host.taskCall && (options.journal?.entries?.length ?? 0) > 0) {
+    throw new WorkflowRuntimeError("Mutable TaskPlan runs refuse generic journal replay; use a selected-branch checkpoint.");
+  }
 
   const { meta, body } = validateScript(script);
   const agentCap = options.agentCap ?? WORKFLOW_AGENT_CAP;
@@ -594,6 +621,12 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
 
   const progress: WorkflowEntry[] = [];
   const inflight = new Set<string>();
+  const taskEffects = new Set<Promise<void>>();
+  const trackTaskEffect = (operation: Promise<void>) => {
+    if (!host.taskCall) return;
+    taskEffects.add(operation);
+    void operation.then(() => taskEffects.delete(operation));
+  };
   /** Label → the child that ran under it, last one wins. The `resume` handle. */
   const completedByLabel = new Map<string, CompletedChild>();
   /**
@@ -628,6 +661,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
   const journalResumes = journalEntries.some(entry => entry.resumed);
   let prefixIntact = journalEntries.length > 0 && !journalResumes;
   let replayedCount = 0;
+  const receipts: Immutable<AgentReceipt>[] = [];
 
   /* --- live control ---------------------------------------------------- */
 
@@ -697,6 +731,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       return true;
     },
     retry: index => {
+      // A mutable-task retry must go through its bounded remediation contract.
+      if (host.taskCall) return false;
       const live = liveAgents.get(index);
       if (live === undefined || !live.started || live.intent !== undefined) return false;
       live.intent = "retry";
@@ -724,6 +760,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       argsJson: options.args === undefined ? undefined : JSON.stringify(options.args),
       itemCap,
       nestedCap: options.nestedCap ?? WORKFLOW_NESTED_CAP,
+      taskEnabled: host.taskCall !== undefined,
     },
   });
 
@@ -747,6 +784,7 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
     const finish = (result: Omit<WorkflowRunResult, "meta" | "progress" | "agentCount" | "replayedCount">) => {
       if (settled) return;
       settled = true;
+      host.cancelTaskCall?.();
       options.signal?.removeEventListener("abort", onAbort);
       // Symmetric with `semaphore.drain()` below: everything parked is woken so
       // it observes the settle and unwinds. Nothing depends on it — the run's
@@ -758,8 +796,25 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
       semaphore.drain();
       // Resolve only once the thread is actually down, so a caller that awaits
       // runWorkflow() is guaranteed not to be leaking one.
-      const settle = () => resolve({ ...result, meta, progress, agentCount, replayedCount });
-      void worker.terminate().then(settle, settle);
+      const settle = () => resolve({ ...result, meta, progress, agentCount, replayedCount,
+        ...(receipts.length > 0 ? { receipts: immutableSnapshot(receipts) } : {}),
+        ...(host.taskProjection ? { taskProjection: host.taskProjection() } : {}) });
+      const termination = worker.terminate().then(() => {}, () => {});
+      if (!host.taskCall) { void termination.then(settle); return; }
+      void (async () => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            termination.then(() => Promise.allSettled([...taskEffects])).then(() => host.settleTaskEffects?.()),
+            new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Task effect/SDK settlement timed out; checkout ownership remains unconfirmed; Human-owned settlement/handoff required.")), TASK_SETTLEMENT_TIMEOUT_MS); }),
+          ]);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          host.taskSettlementFailed?.(message);
+          if (result.status === "completed") result.status = "failed";
+          result.error = [result.error, message].filter(Boolean).join("\n");
+        } finally { if (timer) clearTimeout(timer); settle(); }
+      })();
     };
 
     function onAbort() {
@@ -881,6 +936,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
         ...payload,
         schema: payload.schema !== undefined ? JSON.stringify(payload.schema) : undefined,
       };
+      // Task calls must run binding checks live; S1 does not make journals checkpoints.
+      if (payload.taskAssignment !== undefined) prefixIntact = false;
       let replayed = replayAt(index, journalKey(keyInput));
       // A replayed answer still has to satisfy the schema. The key covers a
       // schema that *changed*, but not a journal that was hand-edited, and not
@@ -1016,13 +1073,15 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           try {
             result =
               resumed !== undefined && resumeAgent !== undefined
-                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved)
+                ? await resumeAgent(resumed.agentId, payload.prompt, onResolved, payload.taskAssignment)
                 : await host.spawnAgent({
                     agentId,
                     index,
                     prompt: payload.prompt,
                     label,
                     agentType,
+                    ...(payload.taskAssignment !== undefined ? { taskAssignment: payload.taskAssignment } : {}),
+                    ...(payload.cwd !== undefined ? { cwd: payload.cwd } : {}),
                     ...(model !== undefined ? { model } : {}),
                     ...(payload.effort !== undefined ? { effort: payload.effort } : {}),
                     ...(compiledSchema !== undefined ? { schema: compiledSchema } : {}),
@@ -1034,6 +1093,10 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
                     ...(payload.gate !== undefined ? { gate: payload.gate } : {}),
                     onResolved,
                   });
+            if (result.receipt) receipts.push(immutableSnapshot(result.receipt));
+            if (result.sessionCleanupError) {
+              emit([{ type: "workflow_log", message: `${label}: Session cleanup not confirmed: ${result.sessionCleanupError}` }]);
+            }
             if (result.ok) {
               // Recorded before the gate runs: the child itself finished, so it is
               // resumable even when its gate rejects the work — "here is what the
@@ -1174,6 +1237,16 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
           emit(message.entries);
           break;
         case "call":
+          if (message.method.startsWith("task.")) {
+            openLaunches.set(message.callId, message.method);
+            if (!host.taskCall) { respond(message.callId, false, undefined, "Task facade is not enabled.", true); break; }
+            const operation = Promise.resolve().then(() => host.taskCall!(message.method.slice(5), message.payload)).then(value => {
+              assertBoundarySafe(value, "task result");
+              respond(message.callId, true, value);
+            }).catch(error => respond(message.callId, false, undefined, error instanceof Error ? error.message : String(error), true));
+            trackTaskEffect(operation);
+            break;
+          }
           if (message.method === "workflow") {
             void handleLoadWorkflow(message.callId, message.payload as WorkflowScriptRef);
             break;
@@ -1182,7 +1255,8 @@ export async function runWorkflow(options: RunWorkflowOptions): Promise<Workflow
             respond(message.callId, false, undefined, `Unknown workflow host method "${message.method}".`, true);
             break;
           }
-          void handleAgent(message.callId, message.payload as AgentCallPayload);
+          trackTaskEffect(handleAgent(message.callId, message.payload as AgentCallPayload)
+            .catch(error => respond(message.callId, false, undefined, error instanceof Error ? error.message : String(error), true)));
           break;
         case "complete": {
           // The script is done, so every launch it made should have been

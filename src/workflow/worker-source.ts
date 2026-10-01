@@ -309,7 +309,7 @@ function optionalText(value, what) {
  * because a typo should stop the script at the call that made it, not surface
  * later as an agent that quietly ran at the wrong depth.
  */
-const EFFORT_LEVELS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /**
  * Every option \`agent()\` understands.
@@ -326,6 +326,8 @@ const AGENT_OPTIONS = [
   "phase",
   "model",
   "agentType",
+  "taskAssignment",
+  "cwd",
   "isolation",
   "gate",
   "resume",
@@ -460,6 +462,14 @@ async function agentIn(scope, prompt, opts) {
   const phaseName = optionalText(options.phase, "agent() opts.phase");
   const model = optionalText(options.model, "agent() opts.model");
   const agentType = optionalText(options.agentType, "agent() opts.agentType");
+  const taskAssignment = options.taskAssignment;
+  if (taskAssignment !== undefined) {
+    if (taskAssignment === null || typeof taskAssignment !== "object" || Array.isArray(taskAssignment)) {
+      throw new Error("agent() opts.taskAssignment must be a TaskAssignment object.");
+    }
+    checkBoundary(taskAssignment, "agent() opts.taskAssignment");
+  }
+  const cwd = optionalText(options.cwd, "agent() opts.cwd");
   const isolation = optionalText(options.isolation, "agent() opts.isolation");
   if (isolation !== undefined && isolation !== "worktree") {
     throw new Error("agent() opts.isolation must be \\"worktree\\".");
@@ -486,6 +496,7 @@ async function agentIn(scope, prompt, opts) {
   // keeps the agent, model and tool contract it was started with. Rejecting is
   // the point: silently ignoring these opts would look like they applied.
   if (resume !== undefined) {
+    if (cwd !== undefined) throw new Error("agent() opts.resume and opts.cwd are mutually exclusive: a resumed agent keeps its workspace.");
     if (agentType !== undefined) {
       throw new Error(
         "agent() opts.resume and opts.agentType are mutually exclusive: a resumed agent keeps the agent type it was started with."
@@ -528,6 +539,8 @@ async function agentIn(scope, prompt, opts) {
     label: label,
     model: model,
     agentType: agentType,
+    taskAssignment: taskAssignment,
+    cwd: cwd,
     isolation: isolation,
     phaseIndex: phaseIndex,
     phaseTitle: phaseTitle,
@@ -737,6 +750,25 @@ async function main() {
     budget: makeBudget(),
     console: rootScope.console,
   };
+  if (workerData.taskEnabled) {
+    const invokeTask = async function (method, payload) {
+      checkBoundary(payload, "task." + method);
+      const value = await callHost("task." + method, payload);
+      return realmParse(JSON.stringify(value));
+    };
+    sandbox.task = Object.freeze({
+      prepare: function (role, options) {
+        if (options !== undefined && (!options || typeof options !== "object" || Array.isArray(options) ||
+          Object.keys(options).some(key => key !== "resume"))) throw new Error("task.prepare options only accept resume.");
+        return invokeTask("prepare", options === undefined ? { role: role } : { role: role, resume: options.resume });
+      },
+      check: function (command) { return invokeTask("check", command); },
+      freeze: function () { return invokeTask("freeze", null); },
+      recordReview: function (verdict) { return invokeTask("recordReview", verdict); },
+      reopen: function (reason) { return invokeTask("reopen", reason); },
+      checkpoint: function () { return invokeTask("checkpoint", null); },
+    });
+  }
   const context = vm.createContext(sandbox, {
     name: "workflow",
     codeGeneration: { strings: false, wasm: false },

@@ -87,6 +87,8 @@ export interface JournalKeyInput {
   resume?: string;
   /** Serialized `agent({ schema })`, when the call asked for one. */
   schema?: string;
+  taskAssignment?: unknown;
+  cwd?: string;
 }
 
 /** Stable hash of a call's payload. Field order is fixed here, not by the caller. */
@@ -106,6 +108,9 @@ export function journalKey(input: JournalKeyInput): string {
     // call keys exactly as it always did, and adding or changing a schema still
     // produces a different key.
     ...(input.schema !== undefined ? [input.schema] : []),
+    // Ordinary keys stay unchanged; a task answer cannot replay as an unbound call.
+    ...(input.taskAssignment !== undefined || input.cwd !== undefined
+      ? [{ taskAssignment: input.taskAssignment ?? null, cwd: input.cwd ?? null }] : []),
   ]);
   return createHash("sha256").update(canonical).digest("hex").slice(0, 32);
 }

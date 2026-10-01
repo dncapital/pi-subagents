@@ -16,16 +16,17 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 |---|---|---|
 | `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
-| `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
+| `model` | `Model` **or** `"provider/modelId"` | Explicit values override profile defaults. Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means unset, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |
 | `isolated` | boolean | Strips extensions, skills and nested tools. **Not** a git worktree — see the trap table below |
 | `inheritContext` | boolean | Fork the parent conversation into the child |
-| `thinkingLevel` | ThinkingLevel | Clamped to what the resolved model supports |
+| `thinkingLevel` | ThinkingLevel | Overrides profile `thinking`. Unsupported explicit requests fail before session creation; `off` disables thinking |
 | `isBackground` | boolean | Occupies a `maxConcurrent` slot and queues behind them. Every RPC spawn runs detached regardless; this is what decides whether it is *pooled* |
 | `bypassQueue` | boolean | Starts immediately even when the concurrency limit would queue it. The slot is still counted once running |
 | `structuredOutput` | CompiledSchema | Makes the child report through a `StructuredOutput` tool |
 | `isolation` | `"worktree"` | Temp git worktree, committed to a `pi-agent-*` branch on completion |
 | `cwd` | absolute path | The agent's tools operate here; `.pi` config still loads from the parent session's project |
+| `taskAssignment` | TaskAssignment v1 | Optional exact retained-workspace contract; full [field/binding/receipt reference](../README.md#bound-task-assignments-and-receipts). Cloned/frozen; requires the exact enabled profile, canonical binding and supported configuration; no fallback or stock worktree isolation |
 | `invocation` | AgentInvocation | Resolved snapshot used for UI display |
 | `signal` | AbortSignal | Aborting it stops the subagent |
 | `onSpawned` / `onQueued` / `onCompaction` / `onBeforeWorktreeCleanup` | functions | Fire as documented on `SpawnOptions` |
@@ -41,9 +42,13 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 | `rootSessionId` | Names a transcript directory, so a forged value is a path-traversal primitive |
 | `resumeSessionFile` | Worse: it names a file to **open and replay** as a conversation. Dispatcher only, and only from a path this extension itself recorded |
 | `reclaim` | Bypasses handle allocation, so a forged value would duplicate a live agent's name and make `@handle` ambiguous |
+| `disposeOnConsume` | Internal nested-profile snapshot; top-level lifetime comes from the selected profile's `dispose_on_consume`, not a caller-forged option |
+| `outputTranscript` | Internal nested-profile snapshot; top-level transcript policy comes from profile `output_transcript`, then the project/global default |
 | `blocking` | Every spawn through here is detached. A forged `blocking` would charge it to the foreground pool and defer it behind a queue whose gate nobody is holding |
 
 **Silently overwritten** — `onToolActivity`, `onTextDelta`, `onTurnEnd`, `onSessionCreated` and `onAssistantUsage` are replaced by the activity tracker's own (`src/index.ts:693`). Every programmatic spawn passes through one funnel so none can supply half-wired callbacks; a half-wired tracker renders worse than none, which is the bug behind a row that reads `thinking…` for an agent's whole life ([#181](https://github.com/tintinweb/pi-subagents/pull/181)).
+
+For `dispose_on_consume` profiles, the selected profile's `max_turns`, `isolated`, `inherit_context` and `isolation` restrictions take precedence over these caller options at the manager boundary, before any worktree allocation. Explicit model and thinking overrides remain allowed. Ordinary default-off profiles retain the existing programmatic option behavior. Combining one-shot lifetime with effective `isolated: true` rejects `structuredOutput` before worktree or SDK/provider startup: it would inject a non-built-in tool. The error names the incompatible structured output/schema request; ordinary and non-isolated schema users are unchanged.
 
 Four things that are not obvious from the tables:
 
@@ -93,10 +98,14 @@ Every failure reaches the caller as `{ success: false, error }`, where `error` i
 Three things the table cannot show:
 
 - **The failure that is not an error.** With `worktreeIsolation` off project-wide, `isolation: "worktree"` is dropped at `src/agent-manager.ts:712` with no error, no note on the record, and a success envelope on the wire. Your agent runs in the main tree. If you asked for isolation because two agents were going to write the same files, they now collide and nothing told you.
-- **`data` is omitted** when a handler returns nothing, so a successful stop or consume reply is a bare `{ success: true }` and `reply.data.anything` throws.
+- **`data` is omitted** when a handler returns nothing, so an ordinary successful stop or consume reply is a bare `{ success: true }` and `reply.data.anything` throws. Task-bound spawn/consume replies add `data.taskAssignment` and `data.receipt`; protocol version remains 2. Cleanup errors still return an error envelope; inspect `getReceipt(id)` for the current unconfirmed lifecycle state.
 - **`requestId` is not validated.** It is interpolated straight into the reply channel, so a caller that omits it gets its reply on the literal channel `subagents:rpc:spawn:reply:undefined` — where every other caller that omitted it is also listening. Send one, and send a unique one.
 
 ## Ownership
+
+Task-bound allocation/resume additionally checks known Manager-owned workers by canonical Git checkout root, not exact cwd. Running, queued, stopped-but-unsettled and SDK-busy ordinary workers in a parent/child/sibling or symlinked directory can block a Task; distinct worktree roots remain distinct. Planned cwd/root observations survive queueing and abort. Parent-session `subagents:task-ownership-unconfirmed` metadata also blocks Task admission across branch selection; it does not confer recovery authority or contain external writers.
+
+Active TaskPlan runs retain their current Manager records through completed-record sweeps, including long checks/review. Confirmed ownership release drops the run's retention; unconfirmed ownership retains it for Human-owned settlement/handoff. This is not SDK-session disposal, a process registry or a promise of cross-session recovery. Ordinary settled records retain normal ten-minute cleanup.
 
 `isTopLevelAgent(record)` is `parentAgentId === undefined && workflowId === undefined` (`src/agent-manager.ts:122-126`). `subagents:rpc:stop` enforces it (`src/cross-extension-rpc.ts:178`): a nested child or a workflow's agent is owned by something that is *waiting on it*, and aborting it out from under that owner turns another extension's stop into a failed step. It is defence in depth rather than a live hole — no RPC hands out agent ids, so a caller has no ordinary way to name one it does not own.
 
@@ -125,9 +134,13 @@ When a background agent finishes, pi-subagents sends the user a completion notif
 
 Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel sits outside the `subagents:rpc:ping` version handshake on purpose (`src/cross-extension-rpc.ts:190`), so you can send it unconditionally and an older pi-subagents with no handler simply keeps notifying.
 
-Consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+For an opt-in `dispose_on_consume` profile, consumption is terminal for the SDK session, not the result record. The flag is set synchronously to preserve the notification race above; the reply awaits bounded cleanup. Shutdown timeout/exception (including handler errors reported through the SDK's `onError` callback) yields an error envelope, not confirmed release. Repeated consumption shares one release operation and reports the same cleanup error. Running and queued runs cannot be consumed; stopped-but-still-settling runs refuse consumption for disposable and task-bound workers. Ordinary stopped reads and consumption retain their existing behavior without waiting for SDK settlement. Final result/status/usage/model metadata, formatted conversation and transcript survive release until ordinary record eviction. Only a blocking foreground return automatically consumes an opted-in record. Detached RPC/registry starts retain their session until explicit result consumption, even when `isBackground` is omitted or false. These agents never persist sessions or create resumable tombstones, and cannot resume/reopen; start a fresh worker instead.
 
-One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
+Opted-in programmatic spawns also wire the existing `.output` transcript helper in the manager, capturing profile `output_transcript` (then project/global default) at spawn time. `false` writes no transcript path/file. Enabled transcripts contain final conversation entries before release, survive record eviction and use the trusted parent/root session metadata, never caller-supplied directory ids. These are best-effort temp files, not a sandbox or permanent archive. Ordinary default-off programmatic transcript behavior is unchanged.
+
+For default profiles, consumption is not terminal. An `@handle` steer un-consumes the record (`src/index.ts:920`) because the agent's reply to that message still needs relaying, and so does a background resume (`src/agent-manager.ts:1135`) because the record is starting a new run.
+
+One related thing that lives nowhere else: on every top-level settle, pi-subagents writes a session entry — not an event — via `pi.appendEntry("subagents:record", …)` (`src/index.ts:585`), carrying `id`, `type`, `description`, `status`, `result`, `error`, `startedAt` and `completedAt`, plus `taskAssignment`/`receipt` for bound tasks. Task lifecycle events also add the same metadata. These are timestamped observations, not continuously updated objects or recovery/approval authority. It exists for cross-extension history reconstruction. It is append-only history, not something to react to.
 
 ## The manager registry
 
@@ -136,9 +149,10 @@ One related thing that lives nowhere else: on every top-level settle, pi-subagen
 | Member | Signature | Notes |
 |---|---|---|
 | `waitForAll()` | `() => Promise<void>` | Resolves when nothing is running. **All** agents, including ones you did not spawn — a shutdown barrier, not a join |
-| `hasRunning()` | `() => boolean` | |
+| `hasRunning()` | `() => boolean` | Includes task attempts stopped but still settling; `waitForAll` rejects an unconfirmed SDK barrier rather than claiming quiescence |
 | `spawn(pi, ctx, type, prompt, options)` | `=> string` | **Is** `spawnTopLevel`, so the strip list above applies identically |
-| `getRecord(id)` | `=> AgentRecord \| undefined` | Filtered through `isTopLevelAgent`, so someone else's child comes back `undefined` rather than leaking |
+| `getRecord(id)` | `=> AgentRecord \| task snapshot \| undefined` | Top-level only. Task records are immutable data snapshots with `taskAssignment`/`receipt`, no SDK session, controller, promise or release callbacks; ordinary records are unchanged |
+| `getReceipt(id)` | `=> Immutable<AgentReceipt> \| undefined` | Fresh immutable host observation for a top-level task agent; ordinary or foreign-owned records return undefined |
 
 The slot is claimed by the first activation only; subagent sessions re-activate this extension in the same process, and unconditionally overwriting would point the registry at a short-lived child manager whose shutdown would then delete the root session's entry ([#128](https://github.com/tintinweb/pi-subagents/pull/128)). Child activations leave it alone, and shutdown releases it only if this activation claimed it (`src/index.ts:747-750`, `:1105-1107`).
 
@@ -152,7 +166,7 @@ Everything added since shipped **without a bump**, because all of it is additive
 
 > A `ping` that answers `2` does not tell you whether `consume` exists, whether model scope is enforced, or whether stop checks ownership.
 
-So: send `consume` unconditionally and ignore the outcome — an older build has no handler and simply keeps notifying, which is exactly why it was left outside the handshake. And treat every error envelope as authoritative rather than trying to predict which checks are in force.
+So: send `consume` unconditionally (inspect the outcome when opt-in disposal confirmation matters) — an older build has no handler and simply keeps notifying, which is exactly why it was left outside the handshake. And treat every error envelope as authoritative rather than trying to predict which checks are in force.
 
 ## Availability
 

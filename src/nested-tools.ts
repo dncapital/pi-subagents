@@ -51,6 +51,8 @@ const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as 
 
 interface NestedSpawnOptions {
   description: string;
+  disposeOnConsume?: boolean;
+  outputTranscript?: boolean;
   model?: Model<any>;
   maxTurns?: number;
   isolated?: boolean;
@@ -89,6 +91,7 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
+  consumeResult(id: string): Promise<boolean>;
   resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
 }
 
@@ -127,7 +130,7 @@ type ResultPosition = "inline" | "fetched";
 
 function formatRecord(record: AgentRecord, position: ResultPosition): string {
   if (record.status === "error") {
-    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}`;
+    return `Agent failed: ${record.error ?? "unknown error"}${partialOutputSuffix(record)}${record.sessionCleanupError ? `\nSession cleanup not confirmed: ${record.sessionCleanupError}` : ""}`;
   }
   if (record.status === "queued" || record.status === "running") {
     return `Agent ${record.id} is ${record.status}.`;
@@ -135,7 +138,8 @@ function formatRecord(record: AgentRecord, position: ResultPosition): string {
   // A truncated run must not read as a finished one. The top-level path carries
   // this in its result headline; a nested result has no headline, so the note
   // leads — appended, it would look like part of the child's own output.
-  const text = record.result?.trim() || record.error?.trim() || "No output.";
+  const text = (record.result?.trim() || record.error?.trim() || "No output.")
+    + (record.sessionCleanupError ? `\nSession cleanup not confirmed: ${record.sessionCleanupError}` : "");
   const note = position === "inline"
     ? getForegroundOutcomeNote(record.status)
     : getStatusNote(record.status);
@@ -182,6 +186,9 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     }),
     execute: async (_toolCallId, params, signal, _onUpdate, ctx) => {
       if (params.resume) {
+        if (params.model != null || params.thinking != null) {
+          throw new Error("Cannot override model or thinking when resuming an agent. Start a fresh agent to change configuration.");
+        }
         const existing = context.manager.getRecord(params.resume);
         if (!ownsRecord(existing, context.parentAgentId)) {
           return textResult(`Nested agent not found or not owned by this parent: "${params.resume}".`, true);
@@ -229,7 +236,7 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         defaultRunInBackground: false,
       });
       let model = ctx.model;
-      if (invocation.modelInput) {
+      if (invocation.modelInput != null) {
         const resolvedModel = resolveModel(invocation.modelInput, ctx.modelRegistry);
         if (typeof resolvedModel === "string") {
           if (invocation.modelFromParams) return textResult(resolvedModel, true);
@@ -257,6 +264,8 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       const childDepth = context.depth + 1;
       const options: NestedSpawnOptions = {
         description: params.description,
+        disposeOnConsume: config?.disposeOnConsume === true,
+        outputTranscript: config?.outputTranscript ?? getOutputTranscriptDefault(),
         model,
         maxTurns: invocation.maxTurns,
         isolated: invocation.isolated,
@@ -312,13 +321,13 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         childId = id;
         if (transcriptSessionId === undefined) return;
         const rec = context.manager.getRecord(id);
-        if (!rec) return;
+        if (!rec || rec.outputFile) return;
         rec.outputFile = createOutputFilePath(context.configCwd, id, transcriptSessionId);
         writeInitialEntry(rec.outputFile, id, params.prompt, ctx.cwd);
       };
       options.onSessionCreated = (session) => {
         const rec = childId === undefined ? undefined : context.manager.getRecord(childId);
-        if (rec?.outputFile && childId !== undefined) {
+        if (rec?.outputFile && !rec.outputCleanup && childId !== undefined) {
           rec.outputCleanup = streamToOutputFile(session, rec.outputFile, childId, ctx.cwd);
         }
       };
@@ -379,13 +388,23 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
       // call is aborted) stops only this wait; the nested child keeps running and
       // stays unconsumed. Queued records have no promise until the manager starts
       // them, so poll — abortably — until they leave the queue, then await.
-      if (params.wait && (record.status === "queued" || record.status === "running")) {
+      if (params.wait && (record.status === "queued" || record.status === "running" || (record.disposeOnConsume && record.runSettled === false))) {
         while (record.status === "queued") {
           await abortable(new Promise<void>(resolve => setTimeout(resolve, 250)), signal);
         }
+        await abortable(context.manager.awaitStartup(record.id), signal);
         if (record.promise) await abortable(record.promise, signal);
       }
-      return textResult(formatRecord(record, "fetched"), record.status === "error");
+      const output = formatRecord(record, "fetched");
+      // Only opt-in lifetimes change here; default nested result behavior stays unchanged.
+      if (record.disposeOnConsume) {
+        try {
+          if (!await context.manager.consumeResult(record.id)) return textResult(`${output}\nAgent is still settling; use wait: true.`);
+        } catch (err) {
+          return textResult(`${output}\nSession cleanup not confirmed: ${err instanceof Error ? err.message : String(err)}`, true);
+        }
+      }
+      return textResult(output, record.status === "error");
     },
   });
 
