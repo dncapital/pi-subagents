@@ -2,14 +2,89 @@
  * types.ts — Type definitions for the subagent system.
  */
 
-import type { ThinkingLevel } from "@earendil-works/pi-ai";
+import type { ThinkingLevel as EnabledThinkingLevel } from "@earendil-works/pi-ai";
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { TaskProjection } from "./task-plan.js";
 import type { LifetimeUsage } from "./usage.js";
 
-export type { ThinkingLevel };
+// pi-ai's reasoning type excludes the valid session-level disable value.
+export type ThinkingLevel = EnabledThinkingLevel | "off";
 
 /** Agent type: any string name (built-in defaults or user-defined). */
 export type SubagentType = string;
+
+/** An observational task contract, not approval authority or an OS sandbox. */
+export interface TaskAssignment {
+  version: 1;
+  taskId: string;
+  attemptId: string;
+  authorityRef: string;
+  role: string;
+  profile: string;
+  configuration: {
+    model: string;
+    thinking: ThinkingLevel;
+    profileFingerprint: string;
+    maxTurns: number;
+    isolated: boolean;
+    inheritContext: boolean;
+  };
+  binding: {
+    repository: string;
+    repositoryRoot: string;
+    workspace: string;
+    branch: string;
+    head: string;
+    sourceFingerprint: string;
+  };
+  /** Repository-relative file/directory prefixes; no globs or traversal. */
+  allowedPaths: string[];
+  allowedActions: ("read" | "write" | "check")[];
+  /** Entry fingerprints from captureTaskSource; null protects absence. */
+  protectedBaseline: Record<string, string | null>;
+  /** Explicit absolute instruction files to read in the assigned workspace. */
+  instructions: string[];
+  /** Required evidence references; requirements, not evidence that checks ran. */
+  evidence: string[];
+  approvedChecks: string[];
+  maxRemediations: number;
+}
+
+export type Immutable<T> = T extends object ? { readonly [K in keyof T]: Immutable<T[K]> } : T;
+
+/** Immutable host evidence for one attempt of an opt-in task-bound agent. */
+export interface AgentReceipt {
+  version: 1;
+  agentId: string;
+  assignment: Immutable<TaskAssignment>;
+  attempt: number;
+  profile: string;
+  /** Actual SDK configuration; null until observed, never the requested value. */
+  effective: { model: string | null; thinking: ThinkingLevel | null; cwd: string | null; configCwd: string };
+  candidate: { fingerprint: string | null; observedAt: number | null; error: string | null };
+  evidence: { required: readonly string[]; transcript: string | null; sessionFile: string | null };
+  execution: {
+    status: AgentRecord["status"];
+    settled: boolean;
+    consumed: boolean;
+    error: string | null;
+    settlementError: string | null;
+  };
+  sdk: {
+    scope: "owned-sdk-session";
+    allocated: boolean;
+    sessionId: string | null;
+    quiescent: boolean | null;
+    disposition: "retained" | "releasing" | "released" | "not-created" | "unconfirmed";
+    cleanupError: string | null;
+  };
+  usage: LifetimeUsage;
+}
+
+export interface AgentTaskMetadata {
+  taskAssignment: Immutable<TaskAssignment>;
+  receipt: Immutable<AgentReceipt>;
+}
 
 /** Names of the three embedded default agents. */
 export const DEFAULT_AGENT_NAMES = ["general-purpose", "Explore", "Plan"] as const;
@@ -56,6 +131,8 @@ export interface AgentConfig {
   maxTurns?: number;
   /** Persist this subagent as a normal pi session instead of keeping it in memory only. */
   persistSession?: boolean;
+  /** Default-off, one-shot lifetime: release the session after result consumption; never resume or persist it. */
+  disposeOnConsume?: boolean;
   /** Write the subagent's .output transcript. Defaults to true; false suppresses only that transcript. */
   outputTranscript?: boolean;
   /** Optional session directory used when persistSession is true. Omitted = pi's normal session location. */
@@ -200,6 +277,17 @@ export interface AgentRecord {
   joinMode?: JoinMode;
   /** Set when result was already consumed via get_subagent_result — suppresses completion notification. */
   resultConsumed?: boolean;
+  /** Lifetime policy selected at spawn, independent of later profile edits. */
+  disposeOnConsume?: boolean;
+  /** Immutable opt-in contract. Runtime lifecycle evidence is private to the manager. */
+  readonly taskAssignment?: Immutable<TaskAssignment>;
+  /** False until startup/run settlement; stopped status alone does not prove this. */
+  runSettled?: boolean;
+  /** Shared release operation across consumption, eviction and parent shutdown. */
+  sessionRelease?: Promise<void>;
+  sessionCleanupError?: string;
+  /** Final formatted conversation retained after one-shot session release. */
+  conversation?: string;
   /** Steering messages queued before the session was ready. */
   pendingSteers?: string[];
   /** Worktree info if the agent is running in an isolated worktree. */
@@ -274,9 +362,7 @@ export interface AgentRecord {
 }
 
 /**
- * What a session reports as its level: pi's `ThinkingLevel` plus the `"off"` a
- * model with thinking disabled reports. Display-only — spawning still takes a
- * `ThinkingLevel`, so this widening cannot leak into an invocation.
+ * What a session reports as its level, including disabled thinking.
  */
 export type EffectiveThinkingLevel = ThinkingLevel | "off";
 
@@ -323,6 +409,9 @@ export interface NotificationDetails {
   outputFile?: string;
   error?: string;
   resultPreview: string;
+  /** Task workflow receipts; additive to ordinary notification text and status. */
+  receipts?: readonly Immutable<AgentReceipt>[];
+  taskProjection?: Immutable<TaskProjection>;
   /** Additional agents in a group notification. */
   others?: NotificationDetails[];
 }

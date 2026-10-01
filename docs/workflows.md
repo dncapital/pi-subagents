@@ -72,7 +72,7 @@ A **`workflow` row in FleetView**, above the agents, carrying its agent counts w
 
 Each row names the model the child *actually* ran on — read back from its session once pi has resolved its defaults, not the string the script asked for — so a fuzzy `model: "haiku"` reads as the model it resolved to, and an `agent()` that named no model still says what it inherited.
 
-The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including a level pi clamped (`thinking: low (asked max)`). The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
+The **inspector**, at `/agents → Workflows` — two panes, two levels: phases on the left, that phase's agents on the right, and `⏎` to descend into one agent's prompt, activity and outcome. The detail pane has room for the canonical `provider/model-id` and the thinking level, including differences from inherited/default levels. Unsupported caller effort or selected profile thinking defaults fail before session creation rather than being clamped. The full key table is in [the README](../README.md#commands); the four that change the run rather than the view are:
 
 | Key | |
 |---|---|
@@ -223,7 +223,9 @@ export const meta = {
 | `scriptPath` | string | A script file, absolute or project-relative. **Takes precedence over `script`** — this is how an edited workflow is re-run |
 | `name` | string | A saved workflow — `<name>.js` in one of the three directories above. Lowest precedence |
 | `args` | any | Handed to the script as the `args` global, verbatim. Must be JSON-shaped |
-| `resumeFromRunId` | string | Replay an earlier run in this session. Matches `^wf_[a-z0-9-]{6,}$` |
+| `resumeFromRunId` | string | Replay an earlier ordinary run in this session. Matches `^wf_[a-z0-9-]{6,}$`; refused for mutable TaskPlan runs |
+| `taskPlan` | TaskPlan v1 | Predeclared Builder and Reviewer contracts; enables only the sequential task facade below |
+| `recoveryCheckpointId` | string | Latest known-safe selected-branch task observation; requires the same TaskPlan and current Manager workers |
 | `title` / `description` | string | Accepted and ignored — for Claude Code parity, so a ported call does not fail. A workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`.
@@ -239,16 +241,70 @@ Spawns one subagent and resolves to its final text — or, with `schema`, to a v
 | `label` | string | Display name in the progress tree. Also the handle `resume` addresses |
 | `phase` | string | Put this agent in a named group, overriding the ambient `phase()`. **Use it inside `pipeline`/`parallel` stages**, where the ambient phase races |
 | `agentType` | string | Which agent definition to use. Defaults to `general-purpose`; built-ins are `general-purpose`, `Explore`, `Plan`, plus your custom agents |
-| `model` | string | `provider/modelId`, or fuzzy like `haiku` |
-| `effort` | string | `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Omitted, the agent definition's own `thinking` decides, then the parent's |
+| `model` | string | Overrides the profile default; `provider/modelId`, or fuzzy like `haiku`. Unresolvable requests fail |
+| `effort` | string | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Explicit values override profile `thinking`; unsupported caller choices or selected profile defaults fail before session creation. Omitted, profile then parent/settings defaults apply |
 | `isolation` | `"worktree"` | Run in a throwaway git worktree. Only when agents write files in parallel and would collide — it costs setup time and disk per agent |
 | `gate` | string | A shell command run after the agent finishes; a non-zero exit fails the agent and its output becomes the error |
 | `resume` | string | Continue the child that ran under that label instead of starting fresh |
 | `schema` | object | A JSON Schema with an object root. Resolves to the validated object instead of text |
+| `cwd` | absolute path | Tools and gates work here; configuration stays in the parent project. Gates use the SDK-observed execution directory, including a copied monorepo subdirectory before cleanup. Cannot be changed on resume |
+| `taskAssignment` | TaskAssignment v1 | Optional exact retained-workspace binding; supply the exact `agentType`, approved configuration, scope and initial source identity. No fallback or stock worktree isolation |
 
-Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an `agentType` that names no known agent falls back to `general-purpose` silently.
+Any other key is rejected **by name** at the call. Note that this checks option *keys*, not option *values* — an ordinary `agentType` that names no known agent falls back to `general-purpose` silently. Task assignments refuse fallback and validate the complete versioned contract host-side.
 
-Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+One-shot profiles (`dispose_on_consume: true`) retain their final `.output` transcript before the blocking workflow result releases the SDK session, subject to the selected profile's `output_transcript` override and project/global default. The file survives record eviction until temp storage is swept; `output_transcript: false` opts out. These children cannot resume. Unconfirmed session cleanup is reported once per actual spawn/resume result in the progress log as `<label>: Session cleanup not confirmed: …`, without changing the answer, schema payload or child success/failure/skip status.
+
+A one-shot profile with effective `isolated: true` rejects `schema` before worktree or SDK/provider startup: `StructuredOutput` would broaden its built-in-only scope. Use text results for the restricted research template. Ordinary profiles and non-isolated one-shot profiles still support schemas.
+
+Combination rules: `resume` cannot be combined with `agentType`, `model`, `effort`, `isolation`, `cwd`, `gate` or `schema` — a resumed child keeps the agent type, model and tree it was started with, and its session predates the `StructuredOutput` tool.
+
+#### Task-bound receipts
+
+Use `agent(prompt, { agentType: args.assignment.profile, taskAssignment: args.assignment })`; [the complete contract/receipt reference](../README.md#bound-task-assignments-and-receipts) describes required fields and helper-produced fingerprints. Work happens in the retained assigned workspace without automatic staging, commits, branches or removal. This metadata does not approve work or hard-confine tools. The manager validates startup, settlement and resume observations; external writers remain the caller's responsibility.
+
+`agent()` still returns text, a schema object or `null`. Task results add immutable `taskAssignment`/`receipt` metadata to host spawn/resume outcomes and the final `runWorkflow()` result's optional `receipts` array. The existing workflow task retains that array and adds it to completion notification `details`; text/schema/null values remain unchanged. A standalone `taskAssignment` does not enable the `task` facade. Requirements listed in a receipt are not proof checks ran, and neither successful text nor a completed status proves candidate scope, SDK release, independent review or merge approval.
+
+For task resume, pass `agent(prompt, { resume: label, taskAssignment: freshAssignment })`; only `attemptId` may differ, within `maxRemediations`, and the actual retained session must already have settled. Disposable profiles still cannot resume. A task gate must exactly match `approvedChecks` and requires the `check` action; it runs in the assigned cwd via the existing gate mechanism, not a new deterministic checkpoint API.
+
+Task `agent()` calls never reuse generic journal answers: they break prefix replay and execute live, so old text cannot stand in for source writes or current lifecycle observations. That is **not safe checkpoint recovery** and does not authorize replaying interrupted authoring; the caller must revalidate authority, binding and writer settlement before a fresh assignment. The [saved Direct recipe](#serial-direct-implementation) uses the opt-in facade below, not standalone assignment/journal replay.
+
+### Opt-in TaskPlan facade
+
+Supply `taskPlan: { version: 1, builder, reviewer }` to `SubagentWorkflow`; each role is a complete externally approved TaskAssignment. Builder uses role `Builder`, read/write/check actions and at least one exact approved check. Reviewer uses role `Reviewer`, read without write, and `inheritContext:false`. Both agree on task/authority references, initial binding, protected baseline and remediation limit; Reviewer source scope cannot widen Builder scope. Profile files, instruction bytes, parent/global settings and actual model/effort/restrictions are revalidated. Configuration roots remain the parent's, not the assigned SDK workspace.
+
+Only this route gets `task`; ordinary scripts gain neither it nor Node/fs/shell globals. Every worker must consume a prepared contract. Gates, ordinary-worker downgrade, stock worktrees and UI retry are refused on this route; repair goes through the bounded `reopen` operation.
+
+| Method | Behavior |
+|---|---|
+| `await task.prepare('builder' \| 'reviewer')` | Fresh attempt ID and current initial source binding derived solely from the predeclared contract. Reviewer can start only after freeze and is always fresh/non-authoring |
+| `await task.prepare('builder', {resume: label})` | After authorized bounded reopen, retain the last Builder's entire original contract except a fresh attempt ID. Use the same current-author `agent(..., {resume: label, taskAssignment})` handle within this run; no recovered conversation is invented |
+| `await task.check(command)` | Exact approved command in canonical retained workspace using existing gate shell/`pi.exec`, 10-minute default timeout and killed handling. Known workers must have actual settled/quiescent receipts and live SDK idle observations. Returns code/killed, before/after fingerprints, at most 8,000 diagnostic characters and a full private artifact; no verification model. Retrying a failed command requires bounded reopen first; unawaited/aborted checks are cancelled through exec's signal |
+| `await task.freeze()` | Require all approved checks passing on exactly the current settled author's source. Records private exact source evidence (HEAD/branch/index/tracked/untracked/type/mode/symlink); no staging, write-tree, commit or cleanup |
+| `await task.recordReview(verdict)` | Require the actual fresh independent Reviewer's structured output and receipt on this exact frozen candidate. Reobserve source after review; arbitrary script verdicts or model SUCCESS cannot pass |
+| `await task.reopen(reason)` | Only after a failed check or COMPLETE Reviewer rejection; consume one shared `maxRemediations`, invalidate old checks/freeze/review, permit only in-scope repair. Fresh workers and checkpoint recovery do not reset the count. The latest reason, source fingerprint and count are retained in the private checkpoint projection |
+| `await task.checkpoint()` | Save a versioned run-local observational projection through parent `pi.appendEntry`, returning a checkpoint ID/private artifact and safe step |
+
+Fresh workers use the prepared profile and assignment: `agent(prompt, {agentType: assignment.profile, taskAssignment: assignment})`. The host forwards declared model, thinking, maxTurns, isolated and inheritContext without silently substituting defaults. `agent()` retains its text/schema/null return, normal usage and budget accounting. Run/notification metadata add `taskProjection`; none of these observations grants acceptance or merge/publication authority.
+
+Task admission and operation boundaries refuse known Manager-owned running, queued, stopped-but-unsettled or SDK-busy workers in the same canonical Git checkout, including ordinary workers. Repository root, child/sibling directories, symlinks and configuration directories share checkout identity; distinct Git worktrees do not. Planned bindings survive queueing and abort. This is Manager-scoped exclusion, not external-process containment. Settled/quiescent `steered` authors may proceed to checks/freeze without rewriting their receipt status or claiming task acceptance.
+
+On script return/error or cancellation, the runtime stops admission, requests cancellation, terminates the worker VM and drains only this Task's checks and agent operations. Abort delivery is not settlement: successful public completion and checkout release require settled owned promises and current Manager/SDK idle, compaction and Bash observations. A three-second settlement timeout returns failure (or preserves an existing killed/failed outcome) with `taskProjection.ownership.state: 'unconfirmed'`, not release. The parent records `subagents:task-ownership-unconfirmed`; all parent-session entries are checked so selecting another branch cannot hide it. Late settlement does not automatically clear that barrier. Human-owned settlement/handoff is required; no automatic clearance/reassignment API is supplied.
+
+Workflow startup validates script metadata, length and control characters before constructing the host or acquiring recovery retention leases; rejected scripts leave existing worker retention unchanged. Run-scoped Manager retention keeps current Task workers available through long checks/review and completed-record sweeps. Confirmed checkout release drops that run's retention; unconfirmed ownership keeps it. Ordinary settled records still use normal ten-minute eviction. Missing/expired records are never reconstructed from persisted receipts. Ownership release is distinct from SDK-session disposal: ordinary resumable Task sessions may remain retained.
+
+Reviewer output must match this object contract (use `schema` on its fresh `agent` call):
+
+```text
+{ version: 1, status: 'COMPLETE', candidateFingerprint: <exact freeze fingerprint>,
+  verdict: 'PASS' | 'REJECT', summary: <nonempty text>,
+  findings: [{ id, severity: 'P0' | 'P1' | 'P2' | 'P3', path, description }] }
+```
+
+Unknown fields, missing/incomplete output, stale fingerprints, duplicate finding IDs and inconsistent verdict/findings are refused. PASS requires no findings; REJECT requires at least one. The submitted verdict must equal the actual Manager-recorded structured output, not copied prose. Reviewer session identity must differ from every Builder session, and its attempt number must be 1.
+
+Artifacts are unique mode-0600 files beside existing parent task output, never inside source. Check/freeze/review and worker-evidence snapshots retain byte identities. `recoveryCheckpointId` reconstructs only `ctx.sessionManager.getBranch()`, refuses stale checkpoints with later observations, and revalidates exact plan/input/configuration/baseline/current source, artifact bytes and CURRENT Manager/SDK settlement. A registered public recovery invocation has a new workflow task ID and retention lease; its restored projection keeps the original checkpoint's `runId` lineage. Safety ownership barriers are tree-wide observations, not selected-branch recovery authority. It can continue known-safe built/checked/frozen/reviewed/reopened observations without replaying completed writes. Pending/interrupted/prepared/checking projections, missing or expired workers, discarded branches, configuration drift and cross-parent sessions block for a Human-owned handoff/reassignment; persisted receipts never prove idle by themselves. There is no process registry or automatic reassignment. External writers and arbitrary Bash/MCP effects are not contained by this facade.
+
+`resumeFromRunId` refuses this mutable route (including attempts to resume it without supplying TaskPlan); ordinary replay remains unchanged. The [saved Direct recipe](#serial-direct-implementation) has synthetic integrated coverage through this public route, real SDK children and local checks with scripted provider answers. Actual-provider and staged-host SDK qualification remain separate; synthetic call counts are not billing or timing gains.
 
 ### `pipeline()` and `parallel()`
 
@@ -313,6 +369,16 @@ A run's concurrency limit is its own, independent of the session's `maxConcurren
 ## Recipes
 
 The orchestration patterns themselves — adversarial verification, judge panels, loop-until-dry — live in exactly one place: the tool description the model reads on every turn. It already knows them. So these are not instructions for writing scripts by hand; they are **what to ask for**, and what the resulting script looks like so you can recognize it in the file.
+
+### Serial Direct implementation
+
+[`direct-implementation.js`](../examples/workflows/direct-implementation.js) consumes a caller-approved TaskPlan; it invents no authority, role, model or effort. Invoke `SubagentWorkflow` with `scriptPath: 'examples/workflows/direct-implementation.js'`, `taskPlan: {version: 1, builder, reviewer}` and `args: {task: '<bounded implementation and acceptance instructions>'}`. These are complete assignments, not role names; use the [contract reference](../README.md#bound-task-assignments-and-receipts) to declare them before execution. Copy the example into a project workflow directory for named discovery; it is not auto-installed.
+
+Fresh Builder -> every exact approved local check -> freeze -> fresh schema-bearing non-authoring Reviewer. Actual failure diagnostics or COMPLETE REJECT findings trigger host-bounded reopen, a fresh scoped Builder, all checks/refreeze and a new Reviewer. Missing/malformed/incomplete outputs fail; no verification-model call or silent PASS. The host's shared `maxRemediations` survives workers and recovery. Results include locally-ready-for-human status, candidate/check/review/checkpoint artifacts and actual per-attempt model/effort/usage/SDK disposition. Full receipts/evidence remain in the private checkpoint/projection. No merge approval, publication, installation or cleanup.
+
+For a known-safe continuation, pass the same TaskPlan, `recoveryCheckpointId` and `args: {task: '<same instructions>', continueFromCheckpoint: true}`. This flag asks the recipe to read `task.checkpoint()` after host recovery; it is not evidence or a replacement for that ID. The actual safeStep controls continuation: built/checked skips recorded checks, frozen starts only a fresh Reviewer, reviewed processes the actual verdict, reopened supplies the exact persisted remediation reason to a fresh Builder before preparing it. Reopened legacy checkpoints without valid source/count-bound repair context refuse continuation and require a Human-owned handoff. Completed Builder writes are not replayed. Missing current writers, interrupted steps and drift remain host refusals; no `resumeFromRunId` or invented conversation handle.
+
+Synthetic qualification in `test/e2e/direct-implementation.e2e.test.ts` runs the actual saved file through the registered public tool and worker VM, real Manager/SDK/tool execution and real local checks. Host API/context and model registry/auth are fixture mocks; provider answers are scripted. It measures child starts separately from provider calls; it does not establish actual-provider reliability, staged SDK compatibility or efficiency/billing gains.
 
 ### Fan out over a list you don't have yet
 
@@ -383,7 +449,7 @@ The agent failed terminally, or you skipped it with `s` in the inspector. These 
 `schema` is pressure, not a guarantee. The child gets a `StructuredOutput` tool, `constrainedSampling` set to `strict: "prefer"`, and a validation-and-retry round trip — three soft pressures, where Claude Code has one hard one (it can force the tool call; this cannot, because `toolChoice` is not plumbed through pi's `AgentSession`). Keep schemas small and flat, and `.filter(Boolean)` after every schema stage.
 
 **The run failed complaining about an un-awaited `agent()`.**
-A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so it fails instead — immediately rather than draining, since an agent that ignores its abort signal would wedge the run forever.
+A dropped `await`, usually inside a `pipeline` stage. The run would otherwise finish while children were still working and throw their results away, so ordinary workflows fail immediately rather than draining. TaskPlan runs instead use the bounded owned-effect drain above; an ignored abort or uncertain SDK observation leaves checkout ownership unconfirmed, never released.
 
 **`Cannot run with isolation: "worktree"`.**
 Not a git repo, no commits yet, or `git worktree add` failed. Isolation is a strict guarantee rather than a hint, so it fails loudly instead of quietly running in your main tree. Initialize git and commit at least once, or drop the option.
@@ -424,10 +490,11 @@ Additions on this side: `gate`, `resume`, `effort`, journal-backed `resumeFromRu
 
 ## Examples
 
-Every file below is executed by `test/workflow-examples.test.ts` against a stub host on each CI run, so none of them can silently rot.
+Ordinary examples run against a stub host in `test/workflow-examples.test.ts`; the task-bound Direct recipe runs through the public route in `test/e2e/direct-implementation.e2e.test.ts`.
 
 | File | Demonstrates | Runs as-is? |
 |---|---|---|
+| [`direct-implementation.js`](../examples/workflows/direct-implementation.js) | Approved serial Builder/check/freeze/fresh Reviewer, bounded repair and checkpoint continuation | Requires TaskPlan and `args.task` |
 | [`fan-out-audit.js`](../examples/workflows/fan-out-audit.js) | Runtime fan-out, `pipeline`, `label`, per-stage `phase` | Yes — takes `args.root` |
 | [`structured-findings.js`](../examples/workflows/structured-findings.js) | `schema` on both stages, objects instead of prose | Yes |
 | [`gated-fix.js`](../examples/workflows/gated-fix.js) | `gate`, `isolation: "worktree"`, `resume` retry loop | Needs a real test command |

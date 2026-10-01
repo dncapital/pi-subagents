@@ -5,7 +5,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import type { ExtensionContext, LoadExtensionsResult } from "@earendil-works/pi-coding-agent";
 import {
   type AgentSession,
@@ -22,12 +22,13 @@ import { runInChildSessionContext } from "./child-context.js";
 import { buildParentContext, extractText } from "./context.js";
 import { DEFAULT_AGENTS } from "./default-agents.js";
 import { detectEnv } from "./env.js";
+import { resolveAgentInvocationConfig } from "./invocation-config.js";
 import { buildMemoryBlock, buildReadOnlyMemoryBlock } from "./memory.js";
 import { createNestedSubagentTools, getMaxSubagentDepth, type NestedAgentManager } from "./nested-tools.js";
 import { buildAgentPrompt, type PromptExtras } from "./prompts.js";
 import { preloadSkills } from "./skill-loader.js";
 import { createStructuredCapture, createStructuredOutputTool, structuredRetryPrompt } from "./structured-output.js";
-import type { SubagentType, ThinkingLevel } from "./types.js";
+import type { Immutable, SubagentType, TaskAssignment, ThinkingLevel } from "./types.js";
 import type { LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 
@@ -399,6 +400,9 @@ export interface RunOptions {
   pi: ExtensionAPI;
   /** Manager-assigned id; suffixes session name to disambiguate parallel spawns (e.g. `Explore#a1b2c3d4`). */
   agentId?: string;
+  /** Manager's selected one-shot lifetime snapshot. Direct callers use the profile default. */
+  disposeOnConsume?: boolean;
+  taskAssignment?: Immutable<TaskAssignment>;
   model?: Model<any>;
   maxTurns?: number;
   signal?: AbortSignal;
@@ -409,9 +413,9 @@ export interface RunOptions {
    * Reopen this pi session file rather than starting an empty conversation.
    * `createAgentSession` seeds itself from whatever its SessionManager holds,
    * so pointing it at an existing file rehydrates that agent's history and the
-   * prompt continues it. Everything else — tools, model, system prompt, turn
-   * caps — is still resolved from the agent type, so the continuation runs
-   * under the type's *current* definition, not the one the original run used.
+   * prompt continues it. Tools, system prompt and turn caps still resolve from
+   * the type's current definition; recorded model/effort are preserved.
+   * Explicit model/effort options are rejected on this path.
    */
   resumeSessionFile?: string;
   /**
@@ -456,7 +460,11 @@ export interface RunOptions {
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
+  /** Host allocation evidence, before naming/binding; does not change onSessionCreated ordering. */
+  onSessionAllocated?: (session: AgentSession) => void;
   onSessionCreated?: (session: AgentSession) => void;
+  /** SDK emit resolves handler failures through onError, not promise rejection. */
+  onSessionShutdownError?: (error: string) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
   /**
@@ -615,6 +623,23 @@ export async function runAgent(
 ): Promise<RunResult> {
   const config = getConfig(type);
   const agentConfig = getAgentConfig(type);
+  const disposeOnConsume = options.disposeOnConsume ?? agentConfig?.disposeOnConsume ?? false;
+  // Nested callers have already resolved restrictions in their own config root.
+  // Direct/host callers must not widen an opted-in profile before session creation.
+  if (disposeOnConsume && !options.nested) {
+    const resolved = resolveAgentInvocationConfig(agentConfig, {
+      max_turns: options.maxTurns, isolated: options.isolated,
+      inherit_context: options.inheritContext,
+    });
+    options = { ...options, maxTurns: resolved.maxTurns, isolated: resolved.isolated,
+      inheritContext: resolved.inheritContext };
+  }
+  if (disposeOnConsume && options.isolated && options.structuredOutput !== undefined) {
+    throw new Error("Structured output/schema is incompatible with isolated one-shot agents: StructuredOutput would broaden their built-in-only tool scope.");
+  }
+  if (disposeOnConsume && options.resumeSessionFile) {
+    throw new Error("One-shot agents cannot reopen a session. Start a fresh agent.");
+  }
 
   // Resolve working directory: worktree override > parent cwd
   const effectiveCwd = options.cwd ?? ctx.cwd;
@@ -680,6 +705,22 @@ export async function runAgent(
     const fallback = DEFAULT_AGENTS.get("general-purpose");
     if (!fallback) throw new Error(`No fallback config available for unknown type "${type}"`);
     systemPrompt = buildAgentPrompt({ ...fallback, name: type }, effectiveCwd, env, parentSystemPrompt, extras);
+  }
+
+  if (options.taskAssignment) {
+    const assignment = options.taskAssignment;
+    systemPrompt += "\n\n# Bound task assignment\n" +
+      `Task: ${assignment.taskId}; attempt: ${assignment.attemptId}; role: ${assignment.role}; profile: ${assignment.profile}.\n` +
+      `Authority reference: ${assignment.authorityRef}. This reference is not itself approval.\n` +
+      `Work only in the retained workspace ${assignment.binding.workspace}. Repository: ${assignment.binding.repositoryRoot}.\n` +
+      `Configuration discovery stays at ${configCwd}; do not adopt the target's .pi extensions, skills, settings or memory.\n` +
+      `Allowed actions: ${assignment.allowedActions.join(", ")}; source paths: ${assignment.allowedPaths.join(", ") || "none"}.\n` +
+      `Protected baseline paths: ${Object.keys(assignment.protectedBaseline).join(", ") || "none"}.\n` +
+      `Read these explicit instruction files before acting: ${assignment.instructions.join(", ")}.\n` +
+      `Required evidence: ${assignment.evidence.join(", ")}. Approved checks: ${assignment.approvedChecks.join("; ") || "none"}.\n` +
+      `Remediation limit: ${assignment.maxRemediations}. Stop on binding, scope, authority or architecture conflict.\n` +
+      "This assignment does not authorize staging, commits, publication, branch/worktree allocation or removal, deployment, or production mutation. " +
+      "Do not delegate this task or create another author. Task scoping is not an OS sandbox. Higher-priority safety and repository instructions still apply.";
   }
 
   // When skills is string[], we've already preloaded them into the prompt.
@@ -828,13 +869,22 @@ export async function runAgent(
     }
   }
 
+  // Reopened histories retain their recorded model/effort, never current defaults.
+  if (options.resumeSessionFile && (options.model != null || options.thinkingLevel != null)) {
+    throw new Error("Cannot override model or thinking when resuming an agent. Start a fresh agent to change configuration.");
+  }
   // Resolve model: explicit option > config.model > parent model
-  const model = options.model ?? resolveDefaultModel(
+  const model = options.resumeSessionFile ? undefined : options.model ?? resolveDefaultModel(
     ctx.model, ctx.modelRegistry, agentConfig?.model,
   );
 
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
-  const thinkingLevel = options.thinkingLevel ?? agentConfig?.thinking;
+  const thinkingLevel = options.resumeSessionFile ? undefined : options.thinkingLevel ?? agentConfig?.thinking;
+  // Reject caller choices and selected profile defaults pi would otherwise silently clamp, including unsupported `off`.
+  if (thinkingLevel != null
+    && (!model || !getSupportedThinkingLevels(model).includes(thinkingLevel))) {
+    throw new Error(`Unsupported thinking level "${thinkingLevel}" for ${model ? `${model.provider}/${model.id}` : "an unresolved model"}.`);
+  }
 
   const disallowedSet = agentConfig?.disallowedTools
     ? new Set(agentConfig.disallowedTools)
@@ -852,7 +902,7 @@ export async function runAgent(
   const nestedRuntime = options.nestedRuntime && options.nestedRuntime.depth < effectiveMaxDepth
     ? options.nestedRuntime
     : undefined;
-  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated
+  const nestedTools = agentConfig?.allowedSubagents && nestedRuntime && !options.isolated && !options.taskAssignment
     ? createNestedSubagentTools({
         manager: nestedRuntime.manager,
         pi: options.pi,
@@ -958,7 +1008,7 @@ export async function runAgent(
   // Frontmatter wins when it says anything; otherwise the project default,
   // which `rememberAgents` supplies for top-level agents only. Same precedence
   // as `outputTranscript`.
-  const persistSession = agentConfig?.persistSession ?? (options.nested ? false : rememberAgents);
+  const persistSession = !disposeOnConsume && (agentConfig?.persistSession ?? (options.nested ? false : rememberAgents));
   const sessionManager = options.resumeSessionFile
     // Reopening an existing conversation: the file already carries its own
     // header (cwd, parent) and history, so none of the create-time options
@@ -1006,6 +1056,10 @@ export async function runAgent(
   }
 
   const { session } = await runInChildSessionContext(() => createAgentSession(sessionOpts));
+  options.onSessionAllocated?.(session);
+
+  // Retain partially constructed one-shot sessions too, so a bind failure can be released.
+  if (disposeOnConsume) options.onSessionCreated?.(session);
 
   const baseSessionName = agentConfig?.name ?? type;
   session.setSessionName(
@@ -1018,6 +1072,9 @@ export async function runAgent(
   // post-bind filter is needed. All ExtensionBindings fields are optional.
   await session.bindExtensions({
     onError: (err) => {
+      if (err.event === "session_shutdown") {
+        options.onSessionShutdownError?.(`Child session shutdown failed: ${err.error}`);
+      }
       options.onToolActivity?.({
         type: "end",
         toolName: `extension-error:${err.extensionPath}`,
@@ -1042,7 +1099,7 @@ export async function runAgent(
     });
   }
 
-  options.onSessionCreated?.(session);
+  if (!disposeOnConsume) options.onSessionCreated?.(session);
 
   // Track turns for graceful max_turns enforcement
   let turnCount = 0;
@@ -1110,7 +1167,7 @@ export async function runAgent(
   const startLen = session.messages.length;
   let structuredRetried = false;
   try {
-    await session.prompt(effectivePrompt);
+    if ((!disposeOnConsume && !options.taskAssignment) || !options.signal?.aborted) await session.prompt(effectivePrompt);
 
     // One more prompt when a schema was asked for and nothing usable came back
     // — the model answered in prose, or only ever called the tool invalidly.

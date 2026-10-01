@@ -187,7 +187,7 @@ It is a literal clone — the session's own entries and the same system prompt, 
 | `direct` | the agent starts here, immediately, with your message verbatim as its prompt. No model call at all, so no latency before it begins |
 | `off` | `@` means only "attach a file" again |
 
-Either way the started agent honours its own frontmatter — `model:`, `thinking:`, `max_turns:` all apply, since neither path passes them and the agent's config wins. Mentioning something as the very first thing in a session works: there is simply no history to carry, and the clone still runs on your model and system prompt. If it cannot deliver at all — a model can always answer in prose instead of calling the tool — the agent is started directly with your text and the toast says so, rather than leaving you with nothing running.
+A fresh mention without explicit model/thinking parameters uses its frontmatter defaults. If the model-mode clone supplies explicit `Agent` parameters, its model/thinking choices override those defaults; `max_turns` and permission restrictions remain locked. Mentioning something as the very first thing in a session works: there is simply no history to carry, and the clone still runs on your model and system prompt. If it cannot deliver at all — a model can always answer in prose instead of calling the tool — the agent is started directly with your text and the toast says so, rather than leaving you with nothing running.
 
 `model` is also the only mode that works outside the TUI: `pi -p '@plan the migration'` clones, spawns, and reports through the normal completion path, where a direct start would have detached the agent and printed nothing. Messaging and resuming stay TUI-only for that reason, in both modes.
 
@@ -195,7 +195,7 @@ Two things to weigh against `direct`: the clone re-sends the whole conversation,
 
 **Named agents.** The `Agent` tool takes an optional `name`, so the orchestrator can call one `auth-audit` instead of leaving you to tell `@explore-2` from `@explore-3`. A name is *additive*: the type-derived handle is still assigned, so `@explore` keeps reaching that agent rather than starting a second one beside it. Both names share one namespace — an alias can never shadow a live handle or the reverse — and the popup shows one row per agent, under its alias, with the type moved into the description. `steer_subagent` and `get_subagent_result` accept a handle too, so you and the model address agents the same way.
 
-**Resuming much later.** Because subagent sessions are persisted by default ([`rememberAgents`](#persistent-settings)), a handle keeps working after the agent's in-memory record is evicted: `@explore anything else?` reopens the conversation from disk. Only the *definition* is re-resolved, so a continuation runs under the agent type's current frontmatter, not the one the first run used. If the type has since been deleted or disabled, the resume is refused rather than falling back to another agent — re-enable it and the handle works again. Names from an evicted agent stay reserved, so a later Explore becomes `explore-2` rather than shadowing something you can still reach; the 100 most recent are kept, and all of them are forgotten on `/new` and session switch. A resumed agent takes those names back, so `@explore` keeps meaning the same conversation. An agent whose session was only ever in memory leaves nothing to reopen, and the mention starts a fresh one instead; if the session file has since been deleted, the mention says so and frees the handle rather than silently sending your message to a new agent.
+**Resuming much later.** Because subagent sessions are persisted by default ([`rememberAgents`](#persistent-settings)), a handle keeps working after the agent's in-memory record is evicted: `@explore anything else?` reopens the conversation from disk. The *definition* is re-resolved for tools and prompts, but recorded model/thinking are preserved rather than reset to current profile defaults. If the type has since been deleted or disabled, the resume is refused rather than falling back to another agent — re-enable it and the handle works again. Names from an evicted agent stay reserved, so a later Explore becomes `explore-2` rather than shadowing something you can still reach; the 100 most recent are kept, and all of them are forgotten on `/new` and session switch. A resumed agent takes those names back, so `@explore` keeps meaning the same conversation. An agent whose session was only ever in memory leaves nothing to reopen, and the mention starts a fresh one instead; if the session file has since been deleted, the mention says so and frees the handle rather than silently sending your message to a new agent.
 
 The grammar mirrors Claude Code's, and is deliberately narrow so nothing gets swallowed by accident:
 
@@ -211,7 +211,7 @@ The grammar mirrors Claude Code's, and is deliberately narrow so nothing gets sw
 
 While an agent is live its handle addresses *it*, so `@explore` never starts a second Explore alongside a running one — use the `Agent` tool for deliberate parallelism. `@<agent-id>` works too. `main` is reserved and can never be an agent's handle (a type slugging to it gets `main-2`); handles are capped at 64 characters. A handle written as typed always wins over the `@agent-` form, so an agent genuinely called `agent-explore` stays reachable. [Nested subagents](#nested-subagents) are not addressable — they are hidden from every top-level surface and only their owner may steer them, so a handle that would name one starts a fresh top-level agent instead of reaching through that boundary. Suggestions list live agents first, then resumable ones, then startable types — and then pi's own file rows, in the same popup: `@` stays the file picker it always was, and the handles are added to it rather than replacing it. Disable the whole thing via `/agents → Settings → Agent mentions`.
 
-A `direct`-mode start takes the non-tool spawn path shared with the scheduler and cross-extension RPC, so — like those — it writes no `.output` transcript. That is the trade for skipping the model call: a `model`-mode start goes through the real `Agent` tool and keeps everything. Live tool activity and the turn counter are *not* part of that trade — a direct start renders them like any other agent. A mention-*resumed* agent goes through the full resume wiring and keeps both in either mode.
+A `direct`-mode start takes the non-tool spawn path shared with the scheduler and cross-extension RPC, so ordinary profiles write no `.output` transcript there. Opt-in `dispose_on_consume` profiles do retain a transcript on these paths, subject to `output_transcript` / `outputTranscript`. That is the trade for skipping the model call: a `model`-mode start goes through the real `Agent` tool and keeps everything. Live tool activity and the turn counter are *not* part of that trade — a direct start renders them like any other agent. A mention-*resumed* agent goes through the full resume wiring and keeps both in either mode.
 
 Individual agent results render Claude Code-style in the conversation:
 
@@ -292,6 +292,16 @@ Then spawn it like any built-in type:
 Agent({ subagent_type: "auditor", prompt: "Review the auth module", description: "Security audit" })
 ```
 
+### Restricted research template
+
+[`examples/agents/research-reader.md`](examples/agents/research-reader.md) is a reusable, one-shot template with only `read`, `grep`, `find`, and `ls`: no shell, source writes, extensions, skills, nesting, inherited conversation or memory. Its eight-turn limit retains the existing separate grace period; it is not a hard time/token budget. The owning caller selects and verifies model/effort explicitly.
+
+The template retains its final `.output` transcript on Agent, RPC/registry and workflow routes, including failure and cancellation, before session release. `output_transcript: false` opts out; files survive consumption and record eviction until the temp directory is swept. The selected transcript policy is captured at spawn time. Writes use the existing best-effort transcript helper, not a filesystem sandbox.
+
+Combining `dispose_on_consume: true` with effective `isolated: true` keeps built-in-only scope: workflow `schema` / programmatic `structuredOutput` requests fail before worktree or SDK/provider startup because they would inject an extra `StructuredOutput` tool. Ordinary profiles and non-isolated one-shot profiles retain structured-output behavior.
+
+Examples are included by the package's ordinary file inclusion, but are **not discovered or installed automatically**. Copy this template into a chosen project's `.pi/agents/` (or `.agents/agents/`) to opt in via existing discovery. No global installation or default-agent change is required.
+
 ### Frontmatter Fields
 
 All fields are optional — sensible defaults for everything.
@@ -309,10 +319,11 @@ All fields are optional — sensible defaults for everything.
 | `memory` | — | Persistent agent memory scope: `project`, `local`, or `user`. Auto-detects read-only agents |
 | `disallowed_tools` | — | Comma-separated tools to deny even if extensions provide them |
 | `isolation` | — | Set to `worktree` to run in an isolated git worktree, or `off` to refuse one even when the caller passes `isolation: "worktree"` (frontmatter is authoritative). `none`, `no`, and `false` are accepted spellings of `off` |
-| `model` | inherit parent | Model — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
-| `thinking` | inherit | off, minimal, low, medium, high, xhigh, max — actual availability depends on your pi version and model; pi clamps unsupported levels down |
+| `model` | inherit parent | Overridable model default — `provider/modelId` or fuzzy name (`"haiku"`, `"sonnet"`). Resolved tolerantly (`.`/`-` and a trailing date stamp are interchangeable) and falls back to the same model under another provider if the named one doesn't have it |
+| `thinking` | inherit | Overridable thinking default: off, minimal, low, medium, high, xhigh, max. Availability depends on pi and the model; unsupported caller choices or selected profile defaults fail before session creation. `off` disables thinking only when supported by the selected model |
 | `max_turns` | unlimited | Max agentic turns before graceful shutdown. `0` or omit for unlimited |
 | `persist_session` | `subagents.json` `rememberAgents` (default `true`) | Persist this subagent as a normal pi session instead of keeping the session in memory only; overrides the `rememberAgents` project default in both directions. It records its spawning session as parent, so it nests under it in `/resume`. The subagent's `.output` transcript is still written either way unless `output_transcript: false` |
+| `dispose_on_consume` | `false` | One-shot lifetime: release the settled SDK session after full-result consumption (`get_subagent_result`, foreground inline return, or RPC consume). A notification preview is not consumption. Results, status, usage, model metadata and final formatted conversation remain inspectable until normal record eviction; `.output` transcripts are retained. Resumes/reopens are refused, and sessions stay in memory even with `persist_session: true` / `rememberAgents` enabled. Cleanup timeouts/errors are reported separately, never as confirmed cleanup or a successful run |
 | `output_transcript` | `true` (or `subagents.json` `outputTranscript`) | Write this subagent's `.output` transcript; when set, overrides the `subagents.json` `outputTranscript` default. Set `false` to write no transcript file or path. Governs only the transcript — independent of `persist_session`, `isolation: worktree`, and `memory:` |
 | `session_dir` | pi default | Optional session directory when `persist_session: true`; omitted uses pi's normal session location, and relative paths resolve from the agent cwd. A session outside the parent's session directory (this override, or `isolation: worktree`) is listed separately, so it shows as a root instead of nesting |
 | `allowed_subagents` | none | Opt in to scoped nested `Agent`, `get_subagent_result`, and `steer_subagent` tools. Omitted / empty / `none` / `false` = no nesting; `all` (or `"*"` / `true`) = any enabled agent; comma-separated list = only those agent types |
@@ -322,7 +333,11 @@ All fields are optional — sensible defaults for everything.
 | `isolated` | `false` | Hermetic specialist mode: forces `extensions: false` + `skills: false` + drops `ext:` selectors. Only built-in tools. Distinct from `isolation: worktree` (filesystem) |
 | `enabled` | `true` | Set to `false` to disable an agent (useful for hiding a default agent per-project) |
 
-Frontmatter is authoritative. If an agent file sets `model`, `thinking`, `max_turns`, `inherit_context`, `run_in_background`, `isolated`, or `isolation`, those values are locked for that agent. `Agent` tool parameters only fill fields the agent config leaves unspecified.
+`model` and `thinking` are **defaults**: explicit caller choices override each independently, then profile values apply, then the existing parent/settings fallback. This applies to direct and nested `Agent` calls, workflows (`model`/`effort`), and RPC (`model`/`thinkingLevel`). Unsupported caller choices and selected profile thinking defaults fail visibly rather than silently inheriting or clamping. A model-only override incompatible with profile thinking fails until the caller supplies a supported thinking level. Only when caller and profile thinking are both absent does the existing parent/settings SDK fallback apply.
+
+Permissions and restrictions are unchanged. Frontmatter `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation` remain locked for `Agent` calls; caller parameters only fill unspecified restriction fields. Tool, extension and nested-delegation boundaries are not broadened.
+
+Resumes preserve their session model/thinking. `Agent({ resume, model/thinking })` is rejected: this path cannot apply configuration changes. Start a fresh agent to change them.
 
 **Forgiving `model:` resolution.** A `model:` pin is matched against pi's model registry tolerantly, so cosmetic id variations don't silently drop the agent back to the parent's model: `.` and `-` are treated as equivalent in version numbers (`claude-haiku-4.5` ≡ `claude-haiku-4-5`), a trailing `-YYYYMMDD` date stamp is optional (`anthropic/claude-haiku-4-5-20251001` matches an undated registry id and vice-versa), and a `provider/modelId` whose named provider doesn't carry that model retries the bare id against every provider. Precedence is **exact → fuzzy under the named provider → same model under any provider → unavailable**, so an exact match always wins and dated snapshots aren't conflated. If nothing resolves, the pin can't run and the agent inherits the parent model — `/agents → Agent types` flags this case as `(unavailable, fallback: inherit)` and shows the resolved target `(→ provider/id)` when resolution lands on a different provider or version than configured. (This is distinct from [Model Scope](#model-scope) enforcement, which matches the `enabledModels` allowlist by *exact* entry.)
 
@@ -417,6 +432,37 @@ Launch a sub-agent.
 | `isolated` | boolean | no | No extension/MCP tools |
 | `isolation` | `"off"` \| `"worktree"` | no | `worktree` runs in an isolated git worktree; `off` (the default) does not. Absent from the schema entirely when `worktreeIsolation: false` |
 | `inherit_context` | boolean | no | Fork parent conversation into agent |
+| `cwd` | absolute path | no | Working directory; configuration discovery stays in the parent project |
+| `task_assignment` | TaskAssignment v1 | no | Opt-in exact retained-workspace task binding; see below |
+
+#### Bound task assignments and receipts
+
+A `TaskAssignment` is an **observational contract**, not approval, an OS sandbox, or permission to publish. The caller must already hold authority for the task. It is optional: calls without it keep ordinary fallback, resume, result and session-lifetime behavior. It does not enable `dispose_on_consume` or change tool restrictions.
+
+Version 1 requires every field in [`src/types.ts`](src/types.ts):
+
+| Group | Required content |
+|---|---|
+| Identity | `version: 1`, `taskId`, fresh `attemptId`, `authorityRef`, `role`, exact enabled `profile` |
+| `configuration` | Exact `provider/model` and supported `thinking`, `profileFingerprint`, resolved `maxTurns` (`0` = unlimited), `isolated`, `inheritContext` |
+| `binding` | `repository` (origin URL), canonical absolute `repositoryRoot` and retained `workspace`, branch, HEAD, `sourceFingerprint` |
+| Scope | Repository-relative literal file/directory prefixes in `allowedPaths`, `allowedActions` (`read`, `write`, `check`), `protectedBaseline` entry fingerprints (`null` protects absence) |
+| Instructions/evidence | Explicit absolute existing instruction files in `instructions`, required `evidence` references, exact `approvedChecks`, nonnegative `maxRemediations` |
+
+The host helpers `captureTaskSource(workspace)` and `taskProfileFingerprint(profile)` in [`src/task-assignment.ts`](src/task-assignment.ts) produce binding observations; never guess a hash. Source fingerprints include canonical identity, stable Git index entries, tracked and git-visible nonignored untracked content, paths, modes and symlink targets. They exclude ignored artifacts and mutable index stat bytes, do not follow symlink targets, and refuse submodules, detached HEADs or repositories without an origin. Paths are prefixes, not globs; traversal and `.git` scope are rejected. A writable assignment needs allowed paths; approved checks need the `check` action.
+
+Inputs are cloned and deeply frozen. The manager checks binding/profile/configuration before dispatch, again at queued start and after SDK allocation before prompting, and observes protected/out-of-scope drift on settlement and resume. Unknown/disabled profiles cannot fall back. Contradictory cwd/configuration, stock `isolation: "worktree"`, nested assignment and persisted-session reopening are refused. Tools work in the assigned retained workspace; `.pi` extensions, skills, settings and memory remain parent-configured. Instructions are explicitly named in the child prompt rather than implicitly adopting target resources. These checks observe drift at boundaries; they do **not** prevent Bash/MCP writes, concurrent external authors or grant authority to run listed checks.
+
+Task-bound results add `taskAssignment` and a host-generated immutable `receipt` without replacing text, schema, status or usage. Receipts include actual SDK model/thinking/working and configuration directories, attempt number, candidate observation/error, transcript/session references, per-attempt usage, terminal execution status, **separate settlement and consumption**, and SDK disposition:
+
+- `not-created`: no SDK session allocated; not a successful disposal claim.
+- `retained`: ordinary resumable lifetime, including after consumption.
+- `releasing` / `released`: an actual release operation, confirmed only after observable SDK idle/compaction/Bash checks and successful shutdown/disposal.
+- `unconfirmed`: idle/disposal observation or cleanup failed; inspect `settlementError`/`cleanupError`. Missing session references and stopped status never prove release.
+
+A stopped task may still be settling. It cannot be consumed, resumed, evicted or replaced by another task writer owned by this manager until its SDK barrier settles; `waitForAll()` reports unconfirmed settlement rather than claiming idle. Admission also refuses known running, queued, stopped-unsettled or SDK-busy ordinary workers in the same canonical Git checkout: child/sibling directories and symlinks do not evade exclusion; distinct worktree roots remain distinct. This is an owned-SDK-session observation, not proof every external process exited. Candidate/evidence requirements are observations and requirements, not proof checks/review passed or merge authority.
+
+Resume requires the identical assignment with only a **fresh `attemptId`**, within `maxRemediations`; the original binding/profile/model/effort remain fixed. Task attempts use fresh promises/abort controllers and separate usage. A pre-aborted foreground resume skips the SDK prompt but still observes the retained session's idle barrier before reporting settlement/consumption. Task transcripts use the existing helper in the assigned workspace, obey `output_transcript`/the project default, flush the final tail and avoid duplicate subscriptions. Disposable profiles remain non-resumable. Standalone assignments do not enable checkpoints or a Direct recipe; use the opt-in TaskPlan workflow route below.
 
 ### `SubagentWorkflow`
 
@@ -428,7 +474,9 @@ Run a deterministic script that orchestrates many subagents. Returns a task id i
 | `scriptPath` | string | no | Path to a script file. Takes precedence over `script` and `name` |
 | `name` | string | no | A saved workflow — `<name>.js` in `.pi/workflows/`, `.agents/workflows/` or `<agent dir>/workflows/`, carrying an `export const meta` declaration |
 | `args` | any | no | Passed through to the script as the `args` global, verbatim |
-| `resumeFromRunId` | string | no | Replay an earlier run in this session — its unchanged leading `agent()` calls return their recorded results instead of spawning |
+| `resumeFromRunId` | string | no | Replay an earlier ordinary run in this session; refused for mutable TaskPlan runs |
+| `taskPlan` | TaskPlan v1 | no | Declare approved Builder and fresh non-authoring Reviewer assignments before execution; enables the sequential `task` facade |
+| `recoveryCheckpointId` | string | no | Latest known-safe TaskPlan observation on the selected parent-session branch; requires `taskPlan` and current Manager receipts |
 | `title` / `description` | string | no | Accepted and ignored, as in Claude Code — a workflow is named by its `meta` block |
 
 At least one of `script` / `scriptPath` / `name` is required; `scriptPath` wins over `script`, which wins over `name`. Each invocation's script is persisted to the session directory and its path returned, so iterating means editing that file and re-running rather than resending the source. A saved workflow reports its own file instead, so the same loop works on it — project `.pi/workflows/` shadows a same-named global one. Those directories are ordinary folders that may hold other scripts, so only files carrying the `export const meta = { name, description }` declaration are listed or resolved; naming anything else reports that it is not a workflow rather than running it. The check is a regex over the source — nothing in the file is executed to make it, and even a real parse evaluates only the `meta` object literal, in an empty `node:vm` context with a 100ms bound.
@@ -455,6 +503,8 @@ return await pipeline(
 
 Concurrency is capped at `max(1, min(16, cpus - 2))` — the run's own limit, independent of the session's `maxConcurrent` pool, which its agents do not enter. There are 1000 agents per run and 4096 items per `parallel`/`pipeline` call.
 
+The opt-in `taskPlan: { version: 1, builder: TaskAssignment, reviewer: TaskAssignment }` route exposes only `task.prepare`, `check`, `freeze`, `recordReview`, `reopen` and `checkpoint`. Contracts must agree on external task/authority, initial baseline and protected scope. Exact approved checks produce bounded diagnostics and full private artifacts; freeze and COMPLETE independent review bind to that precise source. Remediation is bounded across fresh workers. Checkpoint recovery revalidates selected-branch evidence, artifact bytes, inputs and actual current Manager/SDK quiescence; expired/unknown/cross-parent writers require a Human-owned handoff, never inferred idle. Task-only shutdown drains owned checks/workers and verifies current SDK settlement before successful public completion or checkout release. The three-second drain bound leaves ownership `unconfirmed` on timeout, with parent-session safety metadata that remains effective across branch selection and late settlement; Human-owned settlement/handoff is required. Active Tasks retain current Manager records through long checks/review until confirmed release. Settled/quiescent `steered` authors remain usable without relabelling their receipts. Public checkpoint recovery receives a new workflow ID while retaining original projection lineage. The [saved Direct recipe](examples/workflows/direct-implementation.js) uses this facade for serial implementation/check/freeze/fresh review and bounded repairs; see [invocation and recovery](docs/workflows.md#serial-direct-implementation). Synthetic integrated qualification uses real SDK children/local checks with scripted provider answers, not actual-provider or staged-host qualification. Neither recipe nor facade grants OS containment or publication/merge authority. Ordinary calls gain no facade. See [the facade reference](docs/workflows.md#opt-in-taskplan-facade).
+
 **Full guide:** [`docs/workflows.md`](https://github.com/tintinweb/pi-subagents/blob/master/docs/workflows.md) — how the model writes the script for you, how to edit and re-run it, how to save one as a reusable named workflow, plus the complete `agent()` option reference, recipes and troubleshooting.
 
 ### `get_subagent_result`
@@ -466,6 +516,8 @@ Check status and retrieve results from a background agent.
 | `agent_id` | string | yes | Agent ID to check |
 | `wait` | boolean | no | Wait for completion |
 | `verbose` | boolean | no | Include full conversation log |
+
+For `dispose_on_consume` agents, verbose conversation is captured before release and remains available on repeated reads. A stopped status can precede actual SDK settlement: only disposable or task-bound stopped-but-unsettled workers refuse consumption and wait for settlement with `wait: true`. Ordinary stopped reads retain their existing immediate-return behavior. Cleanup failures are returned with the result as `Session cleanup not confirmed` without relabelling failed or partial runs.
 
 Cancelling a `wait: true` call (for example, with `Esc`) stops only the wait. The background agent keeps running, and its completion notification still arrives normally.
 
@@ -509,7 +561,7 @@ The run itself takes five keys, and the footer offers each only while it can act
 | `p` | Pause / resume. Pausing stops *starting* agents; ones already running are left to finish, because killing model work mid-turn throws away everything it has spent. Held time is subtracted from the run's elapsed clock |
 | `s` | Skip the selected agent: its `agent()` call returns `null`, exactly as a terminal failure does, and the row renders skipped. Offered while the agent is queued or running |
 | `r` | Retry the selected agent: the child is stopped and the same call runs again, so the script's `agent()` promise is still the one waiting and gets the new answer. Running agents only — once a call has settled its value is already the script's, and a re-run would have nowhere to put one. The row then reads `attempt 2 · user retry` |
-| `c` | Open the selected agent's **conversation** — the same live, scrolling viewer a fleet-list row opens, over the dialog, which hides itself underneath and comes back when you close it. The one key here that shows something rather than changing the run, so it works at both levels and on an agent that has already finished; reading what a child actually did is most of why anyone opens the inspector. Offered once the child has a record to open, which excludes a queued agent and one replayed from the resume journal. Records are swept ten minutes after they finish, and the key says so rather than opening an empty viewer |
+| `c` | Open the selected agent's **conversation** — the same live, scrolling viewer a fleet-list row opens, over the dialog, which hides itself underneath and comes back when you close it. The one key here that shows something rather than changing the run, so it works at both levels and on an agent that has already finished; reading what a child actually did is most of why anyone opens the inspector. Offered once the child has a record to open, which excludes a queued agent and one replayed from the resume journal. Ordinary settled records are swept ten minutes after they finish, and the key says so rather than opening an empty viewer; active TaskPlan records remain retained until confirmed checkout release |
 
 Skipping is immediate for a running agent and for one held at a pause; an agent parked behind the concurrency limit takes its skip when it reaches the front of the queue.
 
@@ -600,7 +652,7 @@ When on, each subagent spawn's effective model is validated against pi's own `en
 | Pinned in agent frontmatter | Warning toast + the pinned model runs (frontmatter is authoritative) |
 | Parent-inherited (neither set) | Warning toast + parent's model runs |
 
-**Design:** `scopeModels` is a guardrail against the orchestrator picking unexpected models at runtime, not a hard policy against user-level config. The "frontmatter is authoritative" guarantee from v0.5.1 still holds for `model:` — caller params can't override frontmatter, and frontmatter pins run even when out of scope (with a visible warning).
+**Design:** `scopeModels` guards runtime caller choices, not user-level defaults. An explicit caller model is checked as caller-supplied even when the profile has a model default. With no explicit override, profile defaults still run out of scope with a visible warning.
 
 **Nested spawns** ([nested subagents](#nested-subagents)) apply the same table against the parent's config root. The hard-error case is identical; the warning cases proceed silently, since a subagent session has no UI to toast to.
 
@@ -660,7 +712,7 @@ Independent of `reportUsage`: this one is what you read, that one is what your s
 
 Off by default because the row already carries the description, turns, tool uses, tokens and elapsed time, and every character it gains is one the description loses on a narrow terminal. The other surfaces show the pair either way: the `Agent` tool result names the model beside its tags, and the conversation viewer's `↳` row spells out the canonical `provider/model-id`.
 
-Both places report what the run *actually* used, read back from the child session once pi has resolved its defaults and clamped the level to what the model supports — not what the call asked for. Where those differ, the request is kept beside the effective value rather than dropped, whether pi clamped it or an agent file's frontmatter outranked it:
+Both places report what the run *actually* used, read back from the child session once pi has resolved its defaults. Unsupported caller thinking choices and selected profile defaults are rejected before session creation; honored caller overrides are not labelled as suppressed requests. When only parent/settings fallback applies and differs from pi's effective level, the snapshot can still show the difference:
 
 ```text
   ↳ anthropic/claude-haiku-4-5 · thinking: low (asked max) · background
@@ -825,6 +877,8 @@ Say that an agent's result has been shown to the model, so its completion notifi
 pi.events.emit("subagents:rpc:consume", { requestId: crypto.randomUUID(), agentId: "agent-id-here" });
 ```
 
+For `dispose_on_consume` agents, consume also awaits bounded session cleanup; inspect its reply if confirmation matters. Timeout/exception cleanup returns `success: false` while keeping the result consumed to suppress duplicate notifications. Default profiles retain resumable sessions.
+
 This is the bus-side half of what `get_subagent_result` does when it returns a result. A caller that joins an agent on `subagents:completed` and reports the result itself should consume it — otherwise the notification lands after the parent has already answered, costing a turn to dismiss. Fire-and-forget is the intended use: the reply carries nothing to act on, and the channel is outside the `subagents:rpc:ping` version handshake, so a caller can send it unconditionally and an older extension that has no handler simply keeps notifying. Consuming a running or unknown agent is refused (`success: false`) and changes nothing — a running agent has no result to have been read, and its notification is still the caller's only signal that it finished.
 
 Reply channels are scoped per `requestId`, so concurrent requests don't interfere.
@@ -938,6 +992,8 @@ test/                 # vitest suite; e2e/ and perf/ subdirectories
 src/
   index.ts            # Extension entry: tool/command registration, /agents menu, rendering
   types.ts            # Type definitions (AgentConfig, AgentRecord, etc.)
+  task-assignment.ts  # Immutable role contracts and exact Git/source observations
+  task-plan.ts        # Opt-in sequential plan, check, review and projection DTOs
 
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)
@@ -986,6 +1042,7 @@ src/
     progress.ts       # Progress event log and every derived view of it (pure)
     host.ts           # WorkflowHost adapter over AgentManager
     task.ts           # local_workflow task record and batched progress updates
+    task-plan.ts      # Narrow retained-task facade and selected-branch observations
     tool-description.ts # Model-facing description carrying the orchestration patterns
   ui/
     agent-widget.ts       # Persistent widget: spinners, activity, status icons, theming

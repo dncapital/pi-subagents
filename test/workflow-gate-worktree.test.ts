@@ -18,19 +18,22 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/agent-runner.js", () => ({
   runAgent: vi.fn(),
   resumeAgent: vi.fn(),
+  getAgentConversation: vi.fn(() => "retained conversation"),
 }));
 
 import { AgentManager } from "../src/agent-manager.js";
-import { runAgent } from "../src/agent-runner.js";
+import { resumeAgent, runAgent } from "../src/agent-runner.js";
 import { registerAgents } from "../src/agent-types.js";
+import type { AgentConfig } from "../src/types.js";
 import { createWorkflowHost } from "../src/workflow/host.js";
 import type { WorkflowAgentEntry, WorkflowEntry } from "../src/workflow/progress.js";
 import { runWorkflow, type WorkflowSpawnRequest } from "../src/workflow/runtime.js";
@@ -62,7 +65,7 @@ interface ExecResult {
  * instant. Sampling inside the call is the point: afterwards the worktree is
  * gone, so a post-hoc `existsSync` would prove nothing either way.
  */
-function makePi(gate: (command: string) => ExecResult | Promise<ExecResult> = () => execOk("3 passing")) {
+function makePi(gate: (command: string, cwd: string) => ExecResult | Promise<ExecResult> = () => execOk("3 passing")) {
   const gateRuns: GateRun[] = [];
   const exec = vi.fn(
     async (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => {
@@ -85,7 +88,7 @@ function makePi(gate: (command: string) => ExecResult | Promise<ExecResult> = ()
         existed: existsSync(cwd),
         sawChildWork: existsSync(join(cwd, CHILD_FILE)),
       });
-      return await gate(args[args.length - 1]);
+      return await gate(args[args.length - 1], cwd);
     },
   );
   return { pi: { exec } as any, gateRuns, exec };
@@ -112,9 +115,11 @@ function initRepo(): string {
  * `cwd` unset for those, meaning "the session's own directory".
  */
 function childWrites(fallback: string) {
-  vi.mocked(runAgent).mockImplementation(async (_ctx: any, _type: any, _prompt: any, opts: any) => {
-    writeFileSync(join(opts.cwd ?? fallback, CHILD_FILE), "the child wrote this");
-    return { responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
+  vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts) => {
+    const cwd = opts.cwd ?? fallback;
+    writeFileSync(join(cwd, CHILD_FILE), "the child wrote this");
+    return { responseText: "done", session: { sessionManager: { getCwd: () => cwd }, dispose: vi.fn() } as unknown as AgentSession,
+      aborted: false, steered: false };
   });
 }
 
@@ -173,6 +178,30 @@ describe("gate on an isolated child", () => {
 
     // …and the copy is still torn down afterwards: verifying it must not keep it.
     expect(existsSync(worktreePath!)).toBe(false);
+  });
+
+  it("gates a custom monorepo cwd in the copied subdirectory before stock cleanup", async () => {
+    const assigned = join(repo, "package");
+    mkdirSync(assigned);
+    writeFileSync(join(assigned, "README.md"), "# package");
+    execFileSync("git", ["add", "package"], { cwd: repo, stdio: "pipe" });
+    execFileSync("git", ["commit", "-m", "synthetic package"], { cwd: repo, stdio: "pipe" });
+    const { pi, gateRuns } = makePi((_command, cwd) =>
+      existsSync(join(cwd, CHILD_FILE)) ? execOk("copied package verified") : execFail("wrong directory"));
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: repo }), manager });
+    const result = await runWorkflow({
+      script: `${HEAD}return await agent("x", { cwd: args.cwd, gate: "check-child-file", isolation: "worktree" });`,
+      args: { cwd: assigned }, host,
+    });
+    const record = manager.listAgents()[0];
+    expect(vi.mocked(runAgent).mock.calls[0][3].cwd).toBe(record.worktree?.workPath);
+    expect(record.worktree?.workPath).toBe(join(record.worktree!.path, "package"));
+    expect(result.value).toContain("done");
+    expect(gateRuns).toEqual([{ command: "check-child-file", cwd: record.worktree!.workPath, existed: true, sawChildWork: true }]);
+    expect(existsSync(record.worktree!.path)).toBe(false);
+    expect(record.worktreeResult?.hasChanges).toBe(true);
+    expect(execFileSync("git", ["show", `${record.worktreeResult!.branch}:package/${CHILD_FILE}`], { cwd: repo, encoding: "utf-8" }))
+      .toBe("the child wrote this");
   });
 
   it("fails the agent with the gate's output, and still cleans the worktree up", async () => {
@@ -310,6 +339,95 @@ describe("gate on a child with no worktree of its own", () => {
     // No worktree to verify, so the session's tree is the tree the child edited.
     expect(gateRuns[0].cwd).toBe(repo);
     expect(manager.listAgents()[0].worktree).toBeUndefined();
+  });
+});
+
+describe("ordinary retained child assigned cwd", () => {
+  let parent: string;
+  let assigned: string;
+  let manager: AgentManager;
+  beforeEach(() => {
+    registerAgents(new Map());
+    parent = mkdtempSync(join(tmpdir(), "pi-gate-parent-"));
+    assigned = mkdtempSync(join(tmpdir(), "pi-gate-assigned-"));
+    manager = new AgentManager();
+    childWrites(parent);
+  });
+  afterEach(async () => {
+    await manager.dispose();
+    rmSync(parent, { recursive: true, force: true });
+    rmSync(assigned, { recursive: true, force: true });
+    vi.mocked(runAgent).mockReset(); vi.mocked(resumeAgent).mockReset();
+  });
+
+  it("runtime gates an ordinary spawn in its assigned tree, where the answer differs from the parent", async () => {
+    const { pi, gateRuns } = makePi((_command, cwd) =>
+      existsSync(join(cwd, CHILD_FILE)) ? execOk("assigned verified") : execFail("parent has no child work"));
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: parent }), manager });
+    const result = await runWorkflow({
+      script: `${HEAD}return await agent("x", { cwd: args.cwd, gate: "check-child-file" });`,
+      args: { cwd: assigned }, host,
+    });
+    expect(result.value).toBe("done");
+    expect(gateRuns).toEqual([{ command: "check-child-file", cwd: assigned, existed: true, sawChildWork: true }]);
+    expect(vi.mocked(runAgent).mock.calls[0][3].cwd).toBe(assigned);
+    expect(manager.listAgents()[0].session?.sessionManager.getCwd()).toBe(assigned);
+    expect(existsSync(join(parent, CHILD_FILE))).toBe(false);
+    expect(manager.listAgents()[0].worktree).toBeUndefined();
+  });
+
+  it("gates the observed assigned cwd after ordinary one-shot consumption releases the session", async () => {
+    registerAgents(new Map<string, AgentConfig>([["one-shot-gate", {
+      name: "one-shot-gate", description: "one-shot gate probe", systemPrompt: "read the assigned tree",
+      extensions: false, skills: false, promptMode: "replace", outputTranscript: false,
+      disposeOnConsume: true, persistSession: false, isolated: true, inheritContext: false,
+      builtinToolNames: ["read", "grep", "find", "ls"], maxTurns: 8,
+    }]]));
+    const dispose = vi.fn();
+    vi.mocked(runAgent).mockImplementation(async (_ctx, _type, _prompt, opts) => {
+      const cwd = assigned;
+      writeFileSync(join(cwd, CHILD_FILE), "assigned evidence");
+      const session = { sessionManager: { getCwd: () => cwd }, messages: [], dispose } as unknown as AgentSession;
+      opts.onSessionCreated?.(session);
+      return { responseText: "done", session, aborted: false, steered: false };
+    });
+    const { pi, gateRuns } = makePi((_command, cwd) =>
+      existsSync(join(cwd, CHILD_FILE)) ? execOk("assigned verified") : execFail("wrong tree"));
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: parent }), manager });
+    const result = await runWorkflow({
+      script: `${HEAD}return await agent("x", { agentType: "one-shot-gate", cwd: args.cwd, gate: "check-child-file" });`,
+      args: { cwd: `${assigned}/.` }, host,
+    });
+    expect(result.value).toBe("done");
+    expect(gateRuns).toEqual([{ command: "check-child-file", cwd: assigned, existed: true, sawChildWork: true }]);
+    const record = manager.listAgents()[0];
+    expect(record.taskAssignment).toBeUndefined();
+    expect(record.resultConsumed).toBe(true);
+    expect(record.session).toBeUndefined();
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(record.sessionCleanupError).toBeUndefined();
+    expect(existsSync(join(parent, CHILD_FILE))).toBe(false);
+  });
+
+  it("ordinary resume retains its observed assigned cwd for subsequent host gates", async () => {
+    let resumedCwd: string | undefined;
+    vi.mocked(resumeAgent).mockImplementation(async session => {
+      resumedCwd = session.sessionManager.getCwd();
+      writeFileSync(join(resumedCwd, "resumed-work.txt"), "resumed");
+      return { text: "resumed" };
+    });
+    const { pi, gateRuns } = makePi((_command, cwd) =>
+      existsSync(join(cwd, "resumed-work.txt")) ? execOk("resume verified") : execFail("wrong resume tree"));
+    const host = createWorkflowHost({ pi, ctx: ctx({ cwd: parent }), manager });
+    await host.spawnAgent(spawnRequest({ cwd: assigned }));
+    const resumed = await host.resumeAgent!("wf-agent-0", "continue");
+    const gate = await host.runGate!("check-resumed-file", { agentId: "wf-agent-0", cwd: resumed.cwd });
+    expect(gate).toEqual({ ok: true, output: "resume verified" });
+    expect(resumed).toMatchObject({ ok: true, text: "resumed", cwd: assigned });
+    expect(resumedCwd).toBe(assigned);
+    expect(gateRuns).toHaveLength(1);
+    expect(gateRuns[0].cwd).toBe(assigned);
+    expect(existsSync(join(parent, "resumed-work.txt"))).toBe(false);
   });
 });
 

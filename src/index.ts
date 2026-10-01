@@ -36,7 +36,9 @@ import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
 import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
-import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
+import { assertTaskCheckoutOwnership, immutableSnapshot, snapshotTaskAssignment, TaskAssignmentSchema, validateTaskSource } from "./task-assignment.js";
+import { snapshotTaskPlan, type TaskPlan, TaskPlanSchema } from "./task-plan.js";
+import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type AgentTaskMetadata, type Immutable, type JoinMode, type NotificationDetails, type SubagentType, type TaskAssignment, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
   type AgentActivity,
@@ -68,9 +70,10 @@ import { createWorkflowHost } from "./workflow/host.js";
 import { appendJournal, readJournal, type WorkflowJournalEntry } from "./workflow/journal.js";
 import { extractMeta, type WorkflowMeta, workflowCallName } from "./workflow/meta.js";
 import { elapsedMs } from "./workflow/progress.js";
-import { runWorkflow } from "./workflow/runtime.js";
+import { runWorkflow, validateScript } from "./workflow/runtime.js";
 import { resolveWorkflowScript } from "./workflow/saved.js";
 import { completeWorkflowTask, createWorkflowTask, failWorkflowTask, formatWorkflowNotification, resolveResumeTarget, updateWorkflowProgressBatch, type WorkflowTask, workflowResultText, workflowRunId } from "./workflow/task.js";
+import { validateTaskPlanConfiguration } from "./workflow/task-plan.js";
 import { fullWorkflowToolDescription } from "./workflow/tool-description.js";
 import { isWorktreeIsolationEnabled, setWorktreeIsolationEnabled } from "./worktree.js";
 import { escapeXml } from "./xml.js";
@@ -78,7 +81,7 @@ import { escapeXml } from "./xml.js";
 // ---- Shared helpers ----
 
 /** Tool execute return value for a text response. */
-function textResult(msg: string, details?: AgentDetails) {
+function textResult(msg: string, details?: AgentDetails | Partial<AgentTaskMetadata>) {
   return { content: [{ type: "text" as const, text: msg }], details: details as any };
 }
 
@@ -152,7 +155,7 @@ function createActivityTracker(maxTurns?: number, onStreamUpdate?: () => void) {
  * (`off` + every `ThinkingLevel`). Single source for the Agent tool description,
  * the generated-agent template, and the `/agents` wizard so these lists can't
  * drift behind pi again (#147). Availability of any level still depends on the
- * host pi version and the selected model — pi clamps unsupported levels down.
+ * host pi version and the selected model — unsupported explicit requests fail.
  */
 const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
@@ -561,6 +564,7 @@ export default function (pi: ExtensionAPI) {
       durationMs,
       tokens,
       usage,
+      ...taskMetadata(record),
     };
   }
 
@@ -586,6 +590,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id, type: record.type, description: record.description,
       status: record.status, result: record.result, error: record.error,
       startedAt: record.startedAt, completedAt: record.completedAt,
+      ...taskMetadata(record),
     });
 
     // Skip notification if result was already consumed via get_subagent_result
@@ -626,6 +631,7 @@ export default function (pi: ExtensionAPI) {
       id: record.id,
       type: record.type,
       description: record.description,
+      ...taskMetadata(record),
     });
   }, (record, info) => {
     if (!isTopLevelAgent(record)) return;
@@ -645,6 +651,11 @@ export default function (pi: ExtensionAPI) {
     // pool grows in a session that will never drain it.
     if (reportUsage) pendingUsage.add(usage);
   });
+
+  function taskMetadata(record: AgentRecord | undefined): Partial<AgentTaskMetadata> {
+    const receipt = record && manager.getReceipt(record.id);
+    return receipt ? { taskAssignment: receipt.assignment, receipt } : {};
+  }
 
   // Expose manager via Symbol.for() global registry for cross-package access.
   // Standard Node.js pattern for cross-package singletons (used by OpenTelemetry, etc.).
@@ -672,6 +683,9 @@ export default function (pi: ExtensionAPI) {
     reloadCustomAgents();
     const dispatch = resolveSpawnType(type);
     if (!dispatch.ok) throw new Error(dispatch.message);
+    if (options?.taskAssignment !== undefined && (dispatch.fellBackFrom !== undefined || type !== dispatch.type)) {
+      throw new Error("Task assignments require exact profile dispatch; fallback is not permitted.");
+    }
     // Every programmatic spawn lands here — cross-extension RPC, both `@handle`
     // mention paths, and the `Symbol.for("pi-subagents:manager")` registry — and
     // none came through the Agent tool, which is where the UI activity tracker is
@@ -718,6 +732,8 @@ export default function (pi: ExtensionAPI) {
     // awaits nothing. A forged `blocking` would charge it to the foreground
     // pool and could defer it behind a queue whose gate nobody is holding.
     delete safeOptions.blocking;
+    delete safeOptions.disposeOnConsume;
+    delete safeOptions.outputTranscript;
     return spawnResolved(piRef, ctxRef, type, prompt, safeOptions);
   };
 
@@ -741,7 +757,15 @@ export default function (pi: ExtensionAPI) {
     spawn: spawnTopLevel,
     getRecord: (id: string) => {
       const record = manager.getRecord(id);
-      return record !== undefined && isTopLevelAgent(record) ? record : undefined;
+      if (!record || !isTopLevelAgent(record)) return undefined;
+      if (!record.taskAssignment) return record;
+      const { session: _session, promise: _promise, outputCleanup: _cleanup, sessionRelease: _release,
+        abortController: _abort, startGate: _gate, ...snapshot } = record;
+      return immutableSnapshot({ ...snapshot, ...taskMetadata(record) });
+    },
+    getReceipt: (id: string) => {
+      const record = manager.getRecord(id);
+      return record && isTopLevelAgent(record) ? manager.getReceipt(id) : undefined;
     },
   };
   const ownsManagerRegistry = (globalThis as any)[MANAGER_KEY] === undefined;
@@ -804,6 +828,10 @@ export default function (pi: ExtensionAPI) {
           spawn: spawnTopLevel,
           awaitStartup: (id) => manager.awaitStartup(id),
           getRecord: (id) => manager.getRecord(id),
+          getReceipt: (id) => {
+            const record = resolveAgentRef(id);
+            return record && isTopLevelAgent(record) ? manager.getReceipt(record.id) : undefined;
+          },
           // Unguarded on purpose: the stop handler now runs the top-level check
           // itself off `getRecord`, and reports the refusal instead of the
           // "Agent not found" a false from here used to be read as.
@@ -813,11 +841,10 @@ export default function (pi: ExtensionAPI) {
             // Same guard as get_subagent_result: a running agent has no result
             // to consume, and its notification is still the caller's only
             // signal that it finished.
-            if (!record || record.parentAgentId) return false;
-            if (record.status === "running" || record.status === "queued") return false;
-            record.resultConsumed = true;
-            cancelNudge(record.id);
-            return true;
+            if (!record || record.parentAgentId) return Promise.resolve(false);
+            const consumption = manager.consumeResult(record.id);
+            if (record.resultConsumed) cancelNudge(record.id);
+            return consumption;
           },
         },
       });
@@ -921,6 +948,11 @@ export default function (pi: ExtensionAPI) {
         manager.steer(record.id, mention.message);
         pi.events.emit("subagents:steered", { id: record.id, message: mention.message });
         ctx.ui.notify(`Sent to ${target}`, "info");
+        return { action: "handled" };
+      }
+
+      if (record.disposeOnConsume) {
+        ctx.ui.notify(`Cannot resume ${target} — one-shot agent. Start a fresh agent.`, "warning");
         return { action: "handled" };
       }
 
@@ -1279,7 +1311,7 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     existing: AgentRecord,
     prompt: string,
-    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string },
+    opts: { outputTranscript: boolean; maxTurns?: number; toolCallId?: string; taskAssignment?: Immutable<TaskAssignment> },
   ): Promise<AgentRecord | undefined> {
     const id = existing.id;
     const joinMode = resolveJoinMode(defaultJoinMode, true);
@@ -1292,7 +1324,7 @@ export default function (pi: ExtensionAPI) {
     // Reuse the agent's transcript rather than starting a fresh one: the
     // path is deterministic per agent+session, so writing an initial entry
     // would truncate the previous run's turns (see ensureOutputFile).
-    if (opts.outputTranscript) {
+    if (opts.outputTranscript && !existing.taskAssignment) {
       existing.outputFile = createOutputFilePath(ctx.cwd, id, ctx.sessionManager.getSessionId());
       ensureOutputFile(existing.outputFile);
     }
@@ -1312,6 +1344,7 @@ export default function (pi: ExtensionAPI) {
     // run_in_background in that same turn keep going.
     const record = await manager.resume(id, prompt, undefined, {
       isBackground: true,
+      ...(opts.taskAssignment ? { taskAssignment: opts.taskAssignment } : {}),
       onToolActivity: bgCallbacks.onToolActivity,
       onAssistantUsage: bgCallbacks.onAssistantUsage,
       // Fires when the run actually starts — immediately, or on queue
@@ -1320,7 +1353,7 @@ export default function (pi: ExtensionAPI) {
       // there is no subscription left behind for a later run to trip over.
       onStarted: () => {
         const rec = manager.getRecord(id);
-        if (rec?.session && rec.outputFile) {
+        if (rec?.session && rec.outputFile && !rec.outputCleanup) {
           rec.outputCleanup = streamToOutputFile(rec.session, rec.outputFile, id, ctx.cwd, transcriptAnchor);
         }
       },
@@ -1352,6 +1385,7 @@ export default function (pi: ExtensionAPI) {
       type: existing.type,
       description: existing.description,
       isBackground: true,
+      ...taskMetadata(record),
     });
 
     return record;
@@ -1590,6 +1624,8 @@ Terse command-style prompts produce shallow, generic work.
       "Trust but verify: an agent's summary describes intent, not outcome. When an agent writes or edits code, check the actual changes before reporting work as done.",
     ],
     parameters: Type.Object({
+      task_assignment: Type.Optional(TaskAssignmentSchema),
+      cwd: Type.Optional(Type.String({ description: "Assigned working directory; does not change the parent configuration root." })),
       prompt: Type.String({
         description: "The task for the agent to perform.",
       }),
@@ -1771,6 +1807,9 @@ Terse command-style prompts produce shallow, generic work.
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
 
+      const assignment = params.task_assignment === undefined ? undefined : snapshotTaskAssignment(params.task_assignment);
+      if (assignment && params.schedule) throw new Error("Task assignments are immediate retained-workspace runs, not schedules.");
+      if (assignment && params.cwd != null && params.cwd !== assignment.binding.workspace) throw new Error("Task assignment contradicts cwd.");
       const rawType = params.subagent_type as SubagentType;
       // Single decision point for dispatch (#183): unknown, disabled and
       // case-ambiguous types are refused here, BEFORE anything spawns, so a
@@ -1783,6 +1822,9 @@ Terse command-style prompts produce shallow, generic work.
       // make a live agent unresumable the moment its type is deleted, disabled,
       // or gains a case-clashing sibling. Only a real spawn is gated.
       if (!dispatch.ok && !params.resume) return textResult(dispatch.message);
+      if (assignment && !params.resume && (!dispatch.ok || dispatch.fellBackFrom !== undefined || rawType !== assignment.profile)) {
+        throw new Error("Task assignments require the exact enabled profile; fallback is not permitted.");
+      }
       const subagentType = dispatch.ok ? dispatch.type : rawType;
       // What the caller actually asked for, named once: `fellBackFrom` is "" for
       // a blank request, so reading it inline invites the `??`-vs-`||` slip that
@@ -1799,6 +1841,10 @@ Terse command-style prompts produce shallow, generic work.
 
       const displayName = getDisplayName(subagentType);
 
+      if (params.resume && (params.model != null || params.thinking != null)) {
+        throw new Error("Cannot override model or thinking when resuming an agent. Start a fresh agent to change configuration.");
+      }
+
       // Get agent config (if any)
       const customConfig = getAgentConfig(subagentType);
 
@@ -1807,12 +1853,13 @@ Terse command-style prompts produce shallow, generic work.
         defaultRunInBackground: getBackgroundByDefault(),
       });
 
-      // Resolve model from agent config first; tool-call params only fill gaps.
+      // Explicit caller model wins; the agent config supplies the default.
       let model = ctx.model;
-      if (resolvedConfig.modelInput) {
+      if (resolvedConfig.modelInput != null) {
         const resolved = resolveModel(resolvedConfig.modelInput, ctx.modelRegistry);
         if (typeof resolved === "string") {
           if (resolvedConfig.modelFromParams) return textResult(resolved);
+          if (assignment) throw new Error(`Task profile model is unavailable: ${resolved}`);
           // config-specified: silent fallback to parent
         } else {
           model = resolved;
@@ -1845,7 +1892,7 @@ Terse command-style prompts produce shallow, generic work.
       // path can re-enable the transcript by accident.
       const outputTranscript = customConfig?.outputTranscript ?? getOutputTranscriptDefault();
       const attachTranscript = (rec: AgentRecord | undefined, agentId: string): void => {
-        if (!rec || !outputTranscript) return;
+        if (!rec || !outputTranscript || rec.outputFile || rec.taskAssignment) return;
         rec.outputFile = createOutputFilePath(ctx.cwd, agentId, ctx.sessionManager.getSessionId());
         writeInitialEntry(rec.outputFile, agentId, params.prompt, ctx.cwd);
       };
@@ -1909,8 +1956,9 @@ Terse command-style prompts produce shallow, generic work.
        * agent TYPE, not the invocation, so tags taken straight from
        * buildInvocationTags would silently drop `twin`.
        */
-      const detailBaseFor = (rec: AgentRecord | undefined): typeof detailBase => {
-        if (!rec?.invocation) return detailBase;
+      const detailBaseFor = (rec: AgentRecord | undefined): typeof detailBase & Partial<AgentTaskMetadata> => {
+        const metadata = taskMetadata(rec);
+        if (!rec?.invocation) return { ...detailBase, ...metadata };
         const type = rec.type;
         const { modelName: recModelName, tags } = buildInvocationTags(rec.invocation);
         const recModeLabel = getPromptModeLabel(type);
@@ -1921,6 +1969,7 @@ Terse command-style prompts produce shallow, generic work.
           subagentType: type,
           modelName: recModelName,
           tags: recTags.length > 0 ? recTags : undefined,
+          ...metadata,
         };
       };
 
@@ -1973,6 +2022,9 @@ Terse command-style prompts produce shallow, generic work.
         if (!existing || !isTopLevelAgent(existing)) {
           return textResult(`Agent not found: "${params.resume}". It may have been cleaned up.`);
         }
+        if (existing.disposeOnConsume) {
+          return textResult(`Agent "${params.resume}" is one-shot and cannot resume. Start a fresh agent.`);
+        }
         if (!existing.session) {
           return textResult(`Agent "${params.resume}" has no active session to resume.`);
         }
@@ -1999,6 +2051,7 @@ Terse command-style prompts produce shallow, generic work.
             outputTranscript,
             maxTurns: effectiveMaxTurns,
             toolCallId,
+            taskAssignment: assignment,
           });
           if (!record) {
             return textResult(`Failed to resume agent "${params.resume}".`);
@@ -2017,7 +2070,7 @@ Terse command-style prompts produce shallow, generic work.
           );
         }
 
-        const record = await manager.resume(params.resume, params.prompt, signal);
+        const record = await manager.resume(params.resume, params.prompt, signal, assignment ? { taskAssignment: assignment } : undefined);
         if (!record) {
           return textResult(`Failed to resume agent "${params.resume}".`);
         }
@@ -2044,7 +2097,7 @@ Terse command-style prompts produce shallow, generic work.
         bgCallbacks.onSessionCreated = (session: any) => {
           origBgOnSession(session);
           const rec = manager.getRecord(id);
-          if (rec?.outputFile) {
+          if (rec?.outputFile && !rec.outputCleanup) {
             rec.outputCleanup = streamToOutputFile(session, rec.outputFile, id, ctx.cwd);
           }
         };
@@ -2054,6 +2107,8 @@ Terse command-style prompts produce shallow, generic work.
         // reads to the model as a subagent that ran and reported this (#179).
         id = manager.spawn(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          ...(assignment ? { taskAssignment: assignment } : {}),
+          ...(params.cwd !== undefined ? { cwd: params.cwd } : {}),
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
@@ -2106,6 +2161,7 @@ Terse command-style prompts produce shallow, generic work.
           type: subagentType,
           description: params.description,
           isBackground: true,
+          ...taskMetadata(record),
         });
 
         const isQueued = record?.status === "queued";
@@ -2190,7 +2246,7 @@ Terse command-style prompts produce shallow, generic work.
         // Stream conversation to output file (foreground agent logging)
         if (fgId) {
           const rec = manager.getRecord(fgId);
-          if (rec?.outputFile) {
+          if (rec?.outputFile && !rec.outputCleanup) {
             rec.outputCleanup = streamToOutputFile(session, rec.outputFile, fgId, ctx.cwd);
           }
         }
@@ -2208,6 +2264,8 @@ Terse command-style prompts produce shallow, generic work.
       try {
         const fgResult = await manager.spawnAndWait(pi, ctx, subagentType, params.prompt, {
           description: params.description,
+          ...(assignment ? { taskAssignment: assignment } : {}),
+          ...(params.cwd !== undefined ? { cwd: params.cwd } : {}),
           name: params.name as string | undefined,
           model,
           maxTurns: effectiveMaxTurns,
@@ -2247,10 +2305,11 @@ Terse command-style prompts produce shallow, generic work.
       const tokenText = formatLifetimeTokens(record);
 
       const details = buildDetails(detailBaseFor(record), record, fgState, { tokens: tokenText });
+      const cleanupNote = record.sessionCleanupError ? `\nSession cleanup not confirmed: ${record.sessionCleanupError}` : "";
 
       if (record.status === "error") {
         // Error headline + any partial output the run produced before failing.
-        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}`, details);
+        return textResult(`${fallbackNote}Agent failed: ${record.error}${partialOutputSuffix(record)}${cleanupNote}`, details);
       }
 
       const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -2262,7 +2321,7 @@ Terse command-style prompts produce shallow, generic work.
       }
       return textResult(
         `${fallbackNote}Agent completed in ${formatMs(durationMs)} (${statsParts.join(", ")})${getForegroundOutcomeNote(record.status)}.\n\n` +
-        (record.result?.trim() || "No output."),
+        (record.result?.trim() || "No output.") + cleanupNote,
         details,
       );
     },
@@ -2343,6 +2402,9 @@ Terse command-style prompts produce shallow, generic work.
    */
   async function runWorkflowTask(ctx: ExtensionContext, task: WorkflowTask): Promise<void> {
     try {
+      // Recovery acquires Manager leases during host construction. Reject bad
+      // source first; runWorkflow keeps its own validation at the VM boundary.
+      validateScript(task.script);
       const result = await runWorkflow({
         script: task.script,
         args: task.args,
@@ -2354,6 +2416,8 @@ Terse command-style prompts produce shallow, generic work.
           signal: task.abortController.signal,
           rootSessionId: ctx.sessionManager.getSessionId(),
           workflowId: task.id,
+          taskPlan: task.taskPlan,
+          recoveryCheckpointId: task.recoveryCheckpointId,
         }),
         onProgress: entries => updateWorkflowProgressBatch(task, entries),
         // The dialog's pause / skip / retry keys run through this; it is dropped
@@ -2397,6 +2461,8 @@ Terse command-style prompts produce shallow, generic work.
           durationMs: elapsedMs(task, Date.now()),
           error: task.error,
           resultPreview: result.length > 500 ? `${result.slice(0, 500)}…` : result,
+          ...(task.receipts ? { receipts: task.receipts } : {}),
+          ...(task.taskProjection ? { taskProjection: task.taskProjection } : {}),
         },
       }, { deliverAs: "followUp", triggerTurn: true });
     });
@@ -2416,6 +2482,8 @@ Terse command-style prompts produce shallow, generic work.
       "A workflow runs in the background and notifies you when it finishes — do not poll or sleep waiting for it.",
     ],
     parameters: Type.Object({
+      taskPlan: Type.Optional(TaskPlanSchema),
+      recoveryCheckpointId: Type.Optional(Type.String({ description: "Known-safe TaskPlan checkpoint on the selected parent-session branch. Not generic replay or handoff authority." })),
       script: Type.Optional(
         Type.String({
           maxLength: 524288,
@@ -2492,6 +2560,21 @@ Terse command-style prompts produce shallow, generic work.
     },
 
     execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
+      if (params.taskPlan !== undefined && params.resumeFromRunId !== undefined) return textResult("Mutable TaskPlan runs refuse resumeFromRunId; use a selected-branch checkpoint.");
+      if (params.recoveryCheckpointId !== undefined && params.taskPlan === undefined) return textResult("recoveryCheckpointId requires the declared TaskPlan; no ordinary downgrade.");
+      let taskPlan: Immutable<TaskPlan> | undefined;
+      try {
+        if (params.taskPlan !== undefined) {
+          reloadCustomAgents();
+          taskPlan = snapshotTaskPlan(params.taskPlan);
+          assertTaskCheckoutOwnership(ctx, taskPlan.builder.binding.repositoryRoot);
+          if ([...workflowTasks.values()].some(task => task.taskPlan?.builder.binding.repositoryRoot === taskPlan?.builder.binding.repositoryRoot
+            && (task.status === "running" || task.status === "paused" || task.taskProjection?.ownership?.state === "unconfirmed"))) return textResult("Task checkout already has an active or unconfirmed workflow owner; Human-owned settlement required.");
+          manager.assertTaskCheckoutIdle(taskPlan.builder.binding.repositoryRoot);
+          validateTaskPlanConfiguration(taskPlan, ctx);
+          if (params.recoveryCheckpointId === undefined) validateTaskSource(taskPlan.builder);
+        }
+      } catch (error) { return textResult(error instanceof Error ? error.message : String(error)); }
       const resumeFrom = resolveResumeTarget(params.resumeFromRunId, workflowTasks);
       if (resumeFrom !== undefined && !resumeFrom.ok) return textResult(resumeFrom.message);
 
@@ -2544,6 +2627,8 @@ Terse command-style prompts produce shallow, generic work.
         args: params.args,
         meta,
         toolCallId,
+        ...(taskPlan ? { taskPlan } : {}),
+        ...(params.recoveryCheckpointId ? { recoveryCheckpointId: params.recoveryCheckpointId } : {}),
         ...(journalPath !== undefined ? { journalPath } : {}),
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
@@ -2761,13 +2846,14 @@ Terse command-style prompts produce shallow, generic work.
       // completion notification can still be delivered.
       // Queued agents have no promise yet (it's created when the queue starts
       // them), so poll until they leave the queue, then await like a running one.
-      if (params.wait && (record.status === "running" || record.status === "queued")) {
+      if (params.wait && (record.status === "running" || record.status === "queued" || ((record.disposeOnConsume || record.taskAssignment) && record.runSettled === false))) {
         while (record.status === "queued") {
           await abortable(
             new Promise<void>((resolve) => setTimeout(resolve, QUEUE_WAIT_POLL_MS)),
             signal,
           );
         }
+        await abortable(manager.awaitStartup(record.id), signal);
         if (record.promise) await abortable(record.promise, signal);
       }
 
@@ -2798,21 +2884,24 @@ Terse command-style prompts produce shallow, generic work.
         output += record.result?.trim() || "No output.";
       }
 
-      // Mark result as consumed — suppresses the completion notification
-      if (record.status !== "running" && record.status !== "queued") {
-        record.resultConsumed = true;
-        cancelNudge(params.agent_id);
-      }
-
-      // Verbose: include full conversation
-      if (params.verbose && record.session) {
-        const conversation = getAgentConversation(record.session);
+      // Collect before releasing the SDK session; repeated reads use the retained snapshot.
+      if (params.verbose) {
+        const conversation = record.conversation ?? (record.session ? getAgentConversation(record.session) : undefined);
         if (conversation) {
           output += `\n\n--- Agent Conversation ---\n${conversation}`;
         }
       }
 
-      return textResult(output);
+      try {
+        const consumed = await manager.consumeResult(record.id);
+        if (consumed) cancelNudge(record.id);
+        else if ((record.disposeOnConsume || record.taskAssignment) && record.runSettled === false) output += "\nAgent is still settling; result has not been consumed. Use wait: true.";
+      } catch (err) {
+        cancelNudge(record.id);
+        output += `\nSession cleanup not confirmed: ${err instanceof Error ? err.message : String(err)}`;
+      }
+      if (record.outputFile) output += `\nTranscript: ${record.outputFile}`;
+      return textResult(output, record.taskAssignment ? taskMetadata(record) : undefined);
     },
   }));
 

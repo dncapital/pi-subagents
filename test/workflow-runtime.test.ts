@@ -193,6 +193,61 @@ describe("script globals", () => {
   });
 });
 
+describe("session cleanup warnings", () => {
+  it.each(["Child session shutdown timed out", "Child session shutdown failed: cleanup broke", "Child session disposal failed: cleanup broke"])("logs %s once without changing answers or metadata", async (sessionCleanupError) => {
+    const answers: WorkflowSpawnResult[] = [
+      { ok: true, text: "plain evidence" },
+      { ok: true, text: '{"answer":"structured evidence"}' },
+      { ok: false, error: "provider failed" },
+      { ok: false, skipped: true, error: "Stopped." },
+    ];
+    const { host } = stubHost(request => ({ ...answers[request.index], sessionCleanupError, tokens: 12, outputTokens: 3, toolCalls: 2 }));
+    const seen: WorkflowEntry[] = [];
+    const result = await run(
+      `const plain = await agent('plain', { label: 'reader' });
+      const structured = await agent('structured', { label: 'schema', schema: { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'] } });
+      const failed = await agent('failed', { label: 'failed' });
+      const skipped = await agent('skipped', { label: 'skipped' });
+      return [plain, structured, failed, skipped, budget.spent()];`,
+      { host, onProgress: entries => seen.push(...entries) },
+    );
+    expect(result.status).toBe("completed");
+    expect(result.value).toEqual(["plain evidence", { answer: "structured evidence" }, null, null, 12]);
+    const warnings = ["reader", "schema", "failed", "skipped"].map(label => ({
+      type: "workflow_log", message: `${label}: Session cleanup not confirmed: ${sessionCleanupError}`,
+    }));
+    expect(result.progress.filter(e => e.type === "workflow_log")).toEqual(warnings);
+    expect(seen.filter(e => e.type === "workflow_log")).toEqual(warnings);
+    const terminal = agentEntries(result.progress).filter(e => e.state !== "start");
+    expect(terminal.map(e => [e.state, e.tokens, e.toolCalls])).toEqual([
+      ["done", 12, 2], ["done", 12, 2], ["error", 12, 2], ["error", 12, 2],
+    ]);
+    expect(terminal[2].error).toBe("provider failed");
+    expect(terminal[3]).toMatchObject({ skipped: true, error: "Stopped." });
+  });
+
+  it("logs resume cleanup before a gate exception and leaves ordinary results warning-free", async () => {
+    const { host } = stubHost();
+    host.resumeAgent = async () => ({ ok: true, text: "continued", sessionCleanupError: "cleanup broke" });
+    const resumed = await run("await agent('first', { label: 'reader' }); return await agent('again', { resume: 'reader' });", { host });
+    expect(resumed.value).toBe("continued");
+    expect(resumed.progress.filter(e => e.type === "workflow_log")).toEqual([
+      { type: "workflow_log", message: "reader: Session cleanup not confirmed: cleanup broke" },
+    ]);
+    const ordinary = await run("return await agent('plain');", { host: stubHost().host });
+    expect(ordinary.value).toBe("ok:plain");
+    expect(ordinary.progress.filter(e => e.type === "workflow_log")).toEqual([]);
+    const gated = stubHost(() => ({ ok: true, text: "evidence", sessionCleanupError: "cleanup broke" }));
+    gated.host.runGate = async () => { throw new Error("gate broke"); };
+    const result = await run("return await agent('plain', { label: 'reader', gate: 'verify' });", { host: gated.host });
+    expect(result.value).toBeNull();
+    expect(agentEntries(result.progress).at(-1)?.error).toBe("gate broke");
+    expect(result.progress.filter(e => e.type === "workflow_log")).toEqual([
+      { type: "workflow_log", message: "reader: Session cleanup not confirmed: cleanup broke" },
+    ]);
+  });
+});
+
 describe("parallel", () => {
   it("is a barrier and folds a throwing thunk to null", async () => {
     const { host } = stubHost(async request => {

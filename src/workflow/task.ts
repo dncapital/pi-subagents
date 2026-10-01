@@ -15,6 +15,9 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { immutableSnapshot } from "../task-assignment.js";
+import type { TaskPlan, TaskProjection } from "../task-plan.js";
+import type { AgentReceipt, Immutable } from "../types.js";
 import { escapeXml } from "../xml.js";
 import type { WorkflowJournalEntry } from "./journal.js";
 import type { WorkflowMeta } from "./meta.js";
@@ -39,6 +42,9 @@ export interface WorkflowTask {
   workflowName?: string;
   /** The `tool_use_id` of the call that started this, when one did. */
   toolCallId?: string;
+  taskPlan?: Immutable<TaskPlan>;
+  recoveryCheckpointId?: string;
+  taskProjection?: Immutable<TaskProjection>;
 
   /**
    * Pause, skip and retry, once the run is up.
@@ -85,6 +91,8 @@ export interface WorkflowTask {
 
   /** The script's return value, once the run produced one. */
   value?: unknown;
+  /** Immutable observational receipts, never workflow acceptance or recovery authority. */
+  receipts?: readonly Immutable<AgentReceipt>[];
   error?: string;
 }
 
@@ -99,6 +107,8 @@ export function createWorkflowTask(init: {
   journalPath?: string;
   replay?: readonly WorkflowJournalEntry[];
   resumedFrom?: string;
+  taskPlan?: Immutable<TaskPlan>;
+  recoveryCheckpointId?: string;
 }): WorkflowTask {
   return {
     type: "local_workflow",
@@ -110,6 +120,8 @@ export function createWorkflowTask(init: {
     meta: init.meta,
     workflowName: init.meta?.name,
     toolCallId: init.toolCallId,
+    ...(init.taskPlan ? { taskPlan: immutableSnapshot(init.taskPlan) } : {}),
+    ...(init.recoveryCheckpointId ? { recoveryCheckpointId: init.recoveryCheckpointId } : {}),
     journalPath: init.journalPath,
     replay: init.replay,
     resumedFrom: init.resumedFrom,
@@ -204,6 +216,8 @@ export function completeWorkflowTask(task: WorkflowTask, result: WorkflowRunResu
   task.agentCount = Math.max(task.agentCount, result.agentCount);
   task.replayedCount = result.replayedCount;
   task.value = result.value;
+  if (result.receipts) task.receipts = immutableSnapshot(result.receipts);
+  if (result.taskProjection) task.taskProjection = immutableSnapshot(result.taskProjection);
   task.error = result.error;
   task.endTime = Date.now();
 }
@@ -259,6 +273,7 @@ export function resolveResumeTarget(
           : "Nothing has run yet — call this without `resumeFromRunId`."),
     };
   }
+  if (prior.taskPlan) return { ok: false, message: "Mutable TaskPlan runs refuse resumeFromRunId; use a selected-branch checkpoint." };
   if (prior.status === "running") {
     return {
       ok: false,

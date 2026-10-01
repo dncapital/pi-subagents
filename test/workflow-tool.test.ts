@@ -17,7 +17,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initTheme } from "@earendil-works/pi-coding-agent";
+import { type AgentSession, initTheme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
 import { SUBAGENT_TOOL_NAMES } from "../src/agent-runner.js";
@@ -481,6 +481,19 @@ describe("createWorkflowHost — worktree cwd propagation", () => {
     const result = await host.spawnAgent(request({ isolation: "worktree" }));
 
     expect(result.cwd).toBe(worktree);
+  });
+
+  it.each(["spawn", "resume"])("reports SDK-observed retained cwd on ordinary %s, not the unnormalized request", async route => {
+    const child = record({ session: { sessionManager: { getCwd: () => worktree } } as unknown as AgentSession });
+    const stub = stubManager(() => child);
+    stub.resume.mockResolvedValue(child);
+    const host = createWorkflowHost({ pi: makePi().pi, ctx: ctx({ cwd: join(worktree, "..") }), manager: stub.manager });
+    const spawned = await host.spawnAgent(request({ cwd: `${worktree}/.` }));
+    const result = route === "spawn" ? spawned : await host.resumeAgent?.("wf-agent-0", "continue");
+    expect(stub.spawnAndWait.mock.calls[0][4].cwd).toBe(`${worktree}/.`);
+    expect(result?.cwd).toBe(worktree);
+    expect(result?.ok).toBe(true);
+    if (route === "resume") expect(stub.resume).toHaveBeenCalledWith("agent-1", "continue", undefined);
   });
 
   it("reports no cwd once the worktree has been torn down", async () => {

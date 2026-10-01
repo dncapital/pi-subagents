@@ -153,6 +153,7 @@ describe("shipped example workflows", () => {
     // docs/workflows.md has a row per file; a deletion should break this first.
     expect(exampleFiles).toEqual([
       "compose.js",
+      "direct-implementation.js",
       "fan-out-audit.js",
       "gated-fix.js",
       "review-panel.js",
@@ -179,8 +180,10 @@ describe("shipped example workflows", () => {
     },
   );
 
+  // Direct requires an approved TaskPlan, not this ordinary stub. Its actual
+  // public route/SDK/local-check loop runs in e2e/direct-implementation.e2e.test.ts.
   // Tier 2 — the one that actually catches things.
-  describe.each(exampleFiles)("%s", name => {
+  describe.each(exampleFiles.filter(name => name !== "direct-implementation.js"))("%s", name => {
     it("runs to completion against a stub host", async () => {
       const { host } = stubHost();
       const result = await runExample(name, host);

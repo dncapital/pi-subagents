@@ -16,7 +16,7 @@
 import { isTopLevelAgent } from "./agent-manager.js";
 import { type ModelRegistry, resolveModel } from "./model-resolver.js";
 import { checkModelScope } from "./model-scope.js";
-import type { AgentRecord } from "./types.js";
+import type { AgentReceipt, AgentRecord, AgentTaskMetadata, Immutable } from "./types.js";
 
 /** Minimal event bus interface needed by the RPC handlers. */
 export interface EventBus {
@@ -27,7 +27,7 @@ export interface EventBus {
 /** RPC reply envelope — matches pi-mono's RpcResponse shape. */
 export type RpcReply<T = void> =
   | { success: true; data?: T }
-  | { success: false; error: string };
+  | { success: false; error: string; data?: AgentTaskMetadata & { id: string } };
 
 /** RPC protocol version — bumped when the envelope or method contracts change. */
 export const PROTOCOL_VERSION = 2;
@@ -49,7 +49,14 @@ export interface SpawnCapable {
    * completion notification — what `get_subagent_result` does when it returns
    * one. False when there is no such agent, or it has not settled yet.
    */
-  consumeResult(id: string): boolean;
+  consumeResult(id: string): boolean | Promise<boolean>;
+  getReceipt?(id: string): Immutable<AgentReceipt> | undefined;
+}
+
+class TaskRpcError extends Error {
+  constructor(error: unknown, readonly data: AgentTaskMetadata & { id: string }) {
+    super(error instanceof Error ? error.message : String(error));
+  }
 }
 
 export interface RpcDeps {
@@ -82,9 +89,10 @@ function handleRpc<P extends { requestId: string }>(
       const reply: { success: true; data?: unknown } = { success: true };
       if (data !== undefined) reply.data = data;
       events.emit(`${channel}:reply:${params.requestId}`, reply);
-    } catch (err: any) {
+    } catch (err) {
       events.emit(`${channel}:reply:${params.requestId}`, {
-        success: false, error: err?.message ?? String(err),
+        success: false, error: err instanceof Error ? err.message : String(err),
+        ...(err instanceof TaskRpcError ? { data: err.data } : {}),
       });
     }
   });
@@ -159,8 +167,13 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
       // With isolation: "worktree" the agent starts asynchronously — wait for
       // it, so a strict-isolation failure is still an error envelope rather
       // than an id for an agent that never ran.
-      await manager.awaitStartup(id);
-      return { id };
+      try { await manager.awaitStartup(id); } catch (error) {
+        const receipt = manager.getReceipt?.(id);
+        if (receipt) throw new TaskRpcError(error, { id, taskAssignment: receipt.assignment, receipt });
+        throw error;
+      }
+      const receipt = manager.getReceipt?.(id);
+      return { id, ...(receipt ? { taskAssignment: receipt.assignment, receipt } : {}) };
     },
   );
 
@@ -189,8 +202,16 @@ export function registerRpcHandlers(deps: RpcDeps): RpcHandle {
   // not cost the parent a turn. Deliberately outside the ping version
   // handshake: an extension built against protocol v2 simply never calls it.
   const unsubConsume = handleRpc<{ requestId: string; agentId: string }>(
-    events, "subagents:rpc:consume", ({ agentId }) => {
-      if (!manager.consumeResult(agentId)) throw new Error("Agent not found or still running");
+    events, "subagents:rpc:consume", async ({ agentId }) => {
+      try {
+        if (!await manager.consumeResult(agentId)) throw new Error("Agent not found or still running");
+      } catch (error) {
+        const receipt = manager.getReceipt?.(agentId);
+        if (receipt) throw new TaskRpcError(error, { id: receipt.agentId, taskAssignment: receipt.assignment, receipt });
+        throw error;
+      }
+      const receipt = manager.getReceipt?.(agentId);
+      return receipt ? { taskAssignment: receipt.assignment, receipt } : undefined;
     },
   );
 

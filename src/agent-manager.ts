@@ -15,14 +15,18 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
-import { isAbsolute } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import { realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative } from "node:path";
+import { getSupportedThinkingLevels, type Model } from "@earendil-works/pi-ai";
 import type { AgentSession, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getAgentConversation, resolveEffectiveMaxTurns, resumeAgent, runAgent, type ToolActivity } from "./agent-runner.js";
+import { getAgentConfig, resolveSpawnType } from "./agent-types.js";
+import { resolveAgentInvocationConfig } from "./invocation-config.js";
 import { assignHandle, handleBase } from "./mention.js";
-import { describeModel } from "./model-resolver.js";
-import type { AgentInvocation, AgentRecord, AgentTombstone, IsolationMode, MentionResolution, SubagentType, ThinkingLevel } from "./types.js";
+import { describeModel, resolveModel } from "./model-resolver.js";
+import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, streamToOutputFile, writeInitialEntry } from "./output-file.js";
+import { assertTaskCheckoutOwnership, immutableSnapshot, retainedCheckoutRoot, sameTaskContract, snapshotTaskAssignment, type TaskSourceSnapshot, taskProfileFingerprint, validateTaskSource } from "./task-assignment.js";
+import type { AgentInvocation, AgentReceipt, AgentRecord, AgentTombstone, Immutable, IsolationMode, MentionResolution, SubagentType, TaskAssignment, ThinkingLevel } from "./types.js";
 import { addUsage, type LifetimeUsage } from "./usage.js";
 import type { CompiledSchema } from "./workflow/json-schema.js";
 import { cleanupWorktree, createWorktree, isWorktreeIsolationEnabled, pruneWorktrees, } from "./worktree.js";
@@ -168,6 +172,12 @@ interface SpawnArgs {
 
 interface SpawnOptions {
   description: string;
+  /** Opt-in retained-workspace contract; never approval authority. */
+  taskAssignment?: TaskAssignment | Immutable<TaskAssignment>;
+  /** Internal lifetime snapshot for nested profiles resolved in their config root. */
+  disposeOnConsume?: boolean;
+  /** Internal transcript snapshot for nested profiles resolved in their config root. */
+  outputTranscript?: boolean;
   /**
    * Optional memorable name for this instance, becoming a second handle
    * (`@auth-audit`) alongside the type-derived one. Slugged, not validated —
@@ -304,6 +314,8 @@ interface SpawnOptions {
 }
 
 interface ResumeOptions {
+  /** Task resumes require the unchanged contract with a fresh attemptId. */
+  taskAssignment?: TaskAssignment | Immutable<TaskAssignment>;
   /**
    * Run the resumed turn detached in the background: return immediately with
    * the record still "running" (or "queued" at the concurrency limit) and
@@ -341,7 +353,9 @@ const CHILD_SHUTDOWN_TIMEOUT_MS = 3_000;
  * extension armed in `session_start` leaks once per spawn, and its next tick throws
  * `assertActive()` from a bare timer callback — an uncaughtException that kills pi (#242).
  */
-async function shutdownChildSession(session: AgentSession | undefined): Promise<void> {
+async function shutdownChildSession(session: AgentSession | undefined, awaitDisposal = false): Promise<string | undefined> {
+  let error: string | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     const runner = session?.extensionRunner;
     // Optional all the way down: on a pi without the getter, or a stubbed session from a
@@ -352,15 +366,52 @@ async function shutdownChildSession(session: AgentSession | undefined): Promise<
       // already torn down — one hung handler would leave a dead terminal.
       await Promise.race([
         runner.emit({ type: "session_shutdown", reason: "quit" }),
-        new Promise<void>(resolve => setTimeout(resolve, CHILD_SHUTDOWN_TIMEOUT_MS).unref()),
+        new Promise<void>(resolve => {
+          timer = setTimeout(() => { error = "Child session shutdown timed out"; resolve(); }, CHILD_SHUTDOWN_TIMEOUT_MS);
+          timer.unref();
+        }),
       ]);
     }
-  } catch { /* a partial session must degrade, not take the teardown down with it */ }
-  // Always, even on timeout: disposal is what this function ultimately exists to do.
-  try { session?.dispose?.(); } catch { /* ignore */ }
+  } catch (err) {
+    error = `Child session shutdown failed: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  // Always attempt disposal, but do not mistake a timeout/exception for confirmed cleanup.
+  try {
+    if (awaitDisposal) await session?.dispose?.();
+    else session?.dispose?.();
+  } catch (err) {
+    error = `Child session disposal failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+  return error;
+}
+
+interface TaskRunEvidence {
+  assignment: Immutable<TaskAssignment>;
+  baseline: TaskSourceSnapshot;
+  attempts: Set<string>;
+  attempt: number;
+  configCwd: string;
+  ctx: ExtensionContext;
+  outputTranscript: boolean;
+  allocated: boolean;
+  sessionId: string | null;
+  effective: AgentReceipt["effective"];
+  candidate: AgentReceipt["candidate"];
+  disposition: AgentReceipt["sdk"]["disposition"];
+  quiescent: boolean | null;
+  settled: boolean;
+  settlementError: string | null;
+  usageStart: LifetimeUsage;
 }
 
 export class AgentManager {
+  private taskEvidence = new WeakMap<AgentRecord, TaskRunEvidence>();
+  /** Planned binding survives queueing, abort and disappearance of a checkout. */
+  private checkoutBindings = new WeakMap<AgentRecord, { cwd: string; root: string | null }>();
+  /** Run-scoped retention only; ordinary ten-minute cleanup is unchanged. */
+  private taskRetentions = new WeakMap<AgentRecord, Set<string>>();
   private agents = new Map<string, AgentRecord>();
   private cleanupInterval: ReturnType<typeof setInterval>;
   private onComplete?: OnAgentComplete;
@@ -383,6 +434,7 @@ export class AgentManager {
    * startup failure so a late `awaitStartup` still sees it.
    */
   private startups = new Map<string, Promise<void>>();
+  private pendingReleases = new Set<Promise<void>>();
 
   /**
    * Evicted agents that can still be reached by name, keyed by handle. Outlives
@@ -477,6 +529,132 @@ export class AgentManager {
       : this.maxConcurrentForeground === 0 || this.runningForeground < this.maxConcurrentForeground;
   }
 
+  private taskConfiguration(ctx: ExtensionContext, type: string, options: SpawnOptions, assignment: Immutable<TaskAssignment>): SpawnOptions {
+    const dispatch = resolveSpawnType(type);
+    const profile = getAgentConfig(type);
+    if (!dispatch.ok || dispatch.fellBackFrom !== undefined || !profile || profile.enabled === false
+      || type !== assignment.profile || profile.name !== assignment.profile) {
+      throw new Error(`Task requires the exact enabled profile "${assignment.profile}"; fallback is not permitted.`);
+    }
+    if (taskProfileFingerprint(profile) !== assignment.configuration.profileFingerprint) throw new Error("Task profile configuration fingerprint mismatch.");
+    let model = options.model ?? ctx.model;
+    if (options.model === undefined && profile.model !== undefined) {
+      const resolved = resolveModel(profile.model, ctx.modelRegistry);
+      if (typeof resolved === "string") throw new Error(`Task profile model is unavailable: ${resolved}`);
+      model = resolved;
+    }
+    const thinking = options.thinkingLevel ?? profile.thinking;
+    if (!model || `${model.provider}/${model.id}` !== assignment.configuration.model
+      || !ctx.modelRegistry.getAvailable().some(available => available.provider === model.provider && available.id === model.id)) {
+      throw new Error("Task effective model mismatch or unavailable configuration.");
+    }
+    if (thinking !== assignment.configuration.thinking || !getSupportedThinkingLevels(model).includes(thinking)) {
+      throw new Error("Task thinking mismatch or unsupported configuration.");
+    }
+    const resolved = resolveAgentInvocationConfig(profile, {
+      max_turns: options.maxTurns, isolated: options.isolated, inherit_context: options.inheritContext, isolation: options.isolation,
+    });
+    const maxTurns = resolveEffectiveMaxTurns(type, resolved.maxTurns);
+    if ((maxTurns ?? 0) !== assignment.configuration.maxTurns || resolved.isolated !== assignment.configuration.isolated
+      || resolved.inheritContext !== assignment.configuration.inheritContext || resolved.isolation === "worktree") {
+      throw new Error("Task effective restrictions contradict the assignment.");
+    }
+    return { ...options, model, thinkingLevel: thinking, maxTurns, isolated: resolved.isolated, inheritContext: resolved.inheritContext };
+  }
+
+  private attachTaskTranscript(record: AgentRecord, prompt: string, task: TaskRunEvidence, resume = false): void {
+    if (!task.outputTranscript || record.outputCleanup || !record.session) return;
+    const cwd = task.assignment.binding.workspace;
+    if (!record.outputFile) {
+      record.outputFile = createOutputFilePath(cwd, record.id, record.rootSessionId!);
+      writeInitialEntry(record.outputFile, record.id, prompt, cwd);
+    } else ensureOutputFile(record.outputFile);
+    record.outputCleanup = streamToOutputFile(record.session, record.outputFile, record.id, cwd, resume ? record.session.messages.length : undefined);
+  }
+
+  private observeTaskSession(task: TaskRunEvidence, session: AgentSession): void {
+    task.effective.model = session.model ? `${session.model.provider}/${session.model.id}` : null;
+    task.effective.thinking = session.thinkingLevel ?? null;
+    task.effective.cwd = session.sessionManager?.getCwd?.() ?? null;
+  }
+
+  private async settleTask(record: AgentRecord, task: TaskRunEvidence): Promise<void> {
+    try {
+      if (task.allocated) {
+        if (!record.session || typeof record.session.waitForIdle !== "function") throw new Error("Allocated SDK session has no observable idle barrier.");
+        await record.session.waitForIdle();
+        this.observeTaskSession(task, record.session);
+        task.quiescent = record.session.isIdle === true && record.session.isCompacting === false && record.session.isBashRunning === false;
+        if (!task.quiescent) throw new Error("SDK session still has active or unobservable agent, compaction or Bash work.");
+      }
+      task.settled = true;
+      record.runSettled = true;
+    } catch (error) {
+      task.quiescent = false;
+      task.settlementError = error instanceof Error ? error.message : String(error);
+      task.disposition = "unconfirmed";
+      record.runSettled = false;
+    }
+    try {
+      const source = validateTaskSource(task.assignment, task.baseline);
+      task.candidate = { fingerprint: source.fingerprint, observedAt: Date.now(), error: null };
+    } catch (error) {
+      task.candidate = { fingerprint: null, observedAt: Date.now(), error: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  /** Immutable observations only; reading a receipt does not revalidate or approve a candidate. */
+  getReceipt(id: string): Immutable<AgentReceipt> | undefined {
+    const record = this.agents.get(id);
+    const task = record && this.taskEvidence.get(record);
+    if (!record || !task) return undefined;
+    const usage = record.lifetimeUsage;
+    return immutableSnapshot<AgentReceipt>({
+      version: 1, agentId: id, assignment: task.assignment, attempt: task.attempt, profile: record.type,
+      effective: { ...task.effective }, candidate: { ...task.candidate },
+      evidence: { required: task.assignment.evidence, transcript: record.outputFile ?? null, sessionFile: record.sessionFile ?? null },
+      execution: { status: record.status, settled: task.settled, consumed: record.resultConsumed === true,
+        error: record.error ?? null, settlementError: task.settlementError },
+      sdk: { scope: "owned-sdk-session", allocated: task.allocated, sessionId: task.sessionId, quiescent: task.quiescent,
+        disposition: task.disposition, cleanupError: record.sessionCleanupError ?? null },
+      usage: { input: usage.input - task.usageStart.input, output: usage.output - task.usageStart.output,
+        cacheWrite: usage.cacheWrite - task.usageStart.cacheWrite,
+        cacheRead: (usage.cacheRead ?? 0) - (task.usageStart.cacheRead ?? 0), cost: (usage.cost ?? 0) - (task.usageStart.cost ?? 0) },
+    });
+  }
+
+  /** Refuse known overlapping work, including ordinary queued/stopped-unsettled jobs. */
+  assertTaskCheckoutIdle(repositoryRoot: string, excludeId?: string): void {
+    for (const record of this.listAgents()) {
+      if (record.id === excludeId) continue;
+      const session = record.session;
+      const task = this.taskEvidence.get(record);
+      const active = record.status === "running" || record.status === "queued" || record.runSettled === false
+        || session?.isIdle === false || session?.isCompacting === true || session?.isBashRunning === true
+        || task?.disposition === "unconfirmed" || task?.disposition === "releasing";
+      if (!active) continue;
+      const binding = this.checkoutBindings.get(record);
+      const cwd = session?.sessionManager?.getCwd?.() ?? record.worktree?.workPath ?? record.worktree?.path
+        ?? record.taskAssignment?.binding.workspace ?? binding?.cwd;
+      const root = cwd === undefined ? null : retainedCheckoutRoot(cwd)
+        ?? record.taskAssignment?.binding.repositoryRoot ?? binding?.root;
+      const within = cwd === undefined ? undefined : relative(repositoryRoot, cwd);
+      if (cwd === undefined || root === repositoryRoot || root == null && (within === "" || within !== undefined && !within.startsWith("..") && !isAbsolute(within))) {
+        throw new Error(`Task checkout has a known active/pending/SDK-unsettled writer owned by this manager: ${record.id}${root == null ? " (checkout binding unconfirmed)" : ""}.`);
+      }
+    }
+  }
+
+  retainTaskRecord(id: string, runId: string): void {
+    const record = this.getRecord(id);
+    if (!record?.taskAssignment) throw new Error("Task retention requires a current Manager task record; Human-owned handoff required.");
+    const owners = this.taskRetentions.get(record) ?? new Set<string>();
+    owners.add(runId); this.taskRetentions.set(record, owners);
+  }
+  releaseTaskRecords(runId: string): void {
+    for (const record of this.agents.values()) this.taskRetentions.get(record)?.delete(runId);
+  }
+
   /**
    * Spawn an agent and return its ID immediately (for background use).
    * If the concurrency limit is reached, the agent is queued.
@@ -498,11 +676,53 @@ export class AgentManager {
     // can fix and retry; the RPC layer converts throws into error envelopes.
     assertValidSpawnCwd(options.cwd);
 
+    const assignment = options.taskAssignment === undefined ? undefined : snapshotTaskAssignment(options.taskAssignment);
+    if (assignment) {
+      if (options.parentAgentId !== undefined || options.resumeSessionFile) throw new Error("Task assignments cannot create nested authors or reopen an evicted session.");
+      if (options.isolation === "worktree" || getAgentConfig(type)?.isolation === "worktree") throw new Error("Task assignments require a retained workspace, not stock worktree isolation.");
+      if (options.cwd != null && options.cwd !== assignment.binding.workspace) throw new Error("Task assignment contradicts SpawnOptions.cwd.");
+      options = { ...options, cwd: assignment.binding.workspace, taskAssignment: assignment };
+      options = this.taskConfiguration(ctx, type, options, assignment);
+    }
+    if (assignment) {
+      assertTaskCheckoutOwnership(ctx, assignment.binding.repositoryRoot);
+      this.assertTaskCheckoutIdle(assignment.binding.repositoryRoot);
+      for (const existing of this.agents.values()) {
+        const task = this.taskEvidence.get(existing);
+        if (!task) continue;
+        if (task.assignment.taskId === assignment.taskId && task.attempts.has(assignment.attemptId)) throw new Error("Task attemptId is already recorded by this manager.");
+      }
+    }
+    const baseline = assignment ? validateTaskSource(assignment) : undefined;
+    const profile = getAgentConfig(type);
+    const disposeOnConsume = options.disposeOnConsume ?? (profile?.disposeOnConsume === true);
+    // Nested tools already resolve their own config root and pass a trusted lifetime
+    // snapshot. Do not replace their restrictions with the parent's registry entry.
+    if (disposeOnConsume && options.parentAgentId === undefined) {
+      const resolved = resolveAgentInvocationConfig(profile, {
+        max_turns: options.maxTurns, isolated: options.isolated,
+        inherit_context: options.inheritContext, isolation: options.isolation,
+      }, { worktreeAllowed: isWorktreeIsolationEnabled() });
+      options = { ...options, maxTurns: resolved.maxTurns, isolated: resolved.isolated,
+        inheritContext: resolved.inheritContext, isolation: resolved.isolation };
+    }
+    if (disposeOnConsume && options.isolated && options.structuredOutput !== undefined) {
+      throw new Error("Structured output/schema is incompatible with isolated one-shot agents: StructuredOutput would broaden their built-in-only tool scope.");
+    }
+    options = { ...options, outputTranscript: options.parentAgentId === undefined
+      ? profile?.outputTranscript ?? getOutputTranscriptDefault()
+      : options.outputTranscript ?? profile?.outputTranscript ?? getOutputTranscriptDefault() };
+    if (disposeOnConsume && options.resumeSessionFile) {
+      throw new Error("One-shot agents cannot reopen a session. Start a fresh agent.");
+    }
     const id = randomUUID().slice(0, 17);
     const abortController = new AbortController();
     const record: AgentRecord = {
       id,
       type,
+      disposeOnConsume,
+      runSettled: false,
+      ...(assignment ? { taskAssignment: assignment } : {}),
       // Owned children — nested, or a workflow's — are filtered out of every
       // top-level surface, so no handle: nothing can address them and they must
       // not consume a name a top-level sibling could otherwise take.
@@ -540,8 +760,28 @@ export class AgentManager {
       parentAgentId: options.parentAgentId,
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
-      rootSessionId: options.rootSessionId,
+      rootSessionId: disposeOnConsume || assignment
+        ? (options.parentAgentId === undefined ? undefined : this.agents.get(options.parentAgentId)?.rootSessionId)
+          ?? ctx.sessionManager?.getSessionId?.() ?? id
+        : options.rootSessionId,
     };
+    if (assignment && baseline) {
+      const configCwd = realpathSync(options.configCwd ?? ctx.cwd);
+      this.taskEvidence.set(record, {
+        assignment, baseline, attempts: new Set([assignment.attemptId]), attempt: 1,
+        configCwd, ctx, outputTranscript: options.outputTranscript === true,
+        allocated: false, sessionId: null,
+        effective: { model: null, thinking: null, cwd: null, configCwd },
+        candidate: { fingerprint: baseline.fingerprint, observedAt: Date.now(), error: null },
+        disposition: "not-created", quiescent: null, settled: false, settlementError: null,
+        usageStart: { ...record.lifetimeUsage },
+      });
+      Object.defineProperty(record, "taskAssignment", {
+        enumerable: true, get: () => this.taskEvidence.get(record)?.assignment,
+      });
+    }
+    this.checkoutBindings.set(record, { cwd: options.cwd ?? ctx.cwd,
+      root: assignment?.binding.repositoryRoot ?? retainedCheckoutRoot(options.cwd ?? ctx.cwd) });
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
     // handle — a spawn named after its own type gets `explore-2`, not a
@@ -599,6 +839,9 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        record.runSettled = true;
+        const task = this.taskEvidence.get(record);
+        if (task) task.settled = true;
       }
       return false;
     }
@@ -624,7 +867,10 @@ export class AgentManager {
       () => { this.startups.delete(id); },
       (err) => {
         this.startups.delete(id);
-        if (queuedPool !== undefined) {
+        record.runSettled = true;
+        const task = this.taskEvidence.get(record);
+        if (task) task.settled = true;
+        if (queuedPool !== undefined || task) {
           // Mirrors settleRun: an inline caller gets this failure as a throw
           // out of spawnAndWait, so an unconsumed record would ALSO nudge the
           // session about it — the same failure reported twice.
@@ -672,6 +918,12 @@ export class AgentManager {
     // spawn()'s check, and the directory may be gone by then (TOCTOU). Same
     // curated errors; drainQueue parks a throw on the record as an error.
     assertValidSpawnCwd(options.cwd);
+    const task = this.taskEvidence.get(record);
+    if (task) {
+      this.assertTaskCheckoutIdle(task.assignment.binding.repositoryRoot, id);
+      this.taskConfiguration(ctx, type, options, task.assignment);
+      validateTaskSource(task.assignment);
+    }
     // Single resolution point for the caller-supplied cwd — the worktree base
     // repo and both cleanup calls below MUST agree on this value forever.
     const customCwd = options.cwd ?? undefined; // null (RPC "unset") → undefined
@@ -736,6 +988,7 @@ export class AgentManager {
       if (record.status !== "running") {
         releaseSlot();
         record.worktreeResult = await cleanupWorktree(pi, baseCwd, wt, options.description);
+        record.runSettled = true;
         this.drainQueue();
         return;
       }
@@ -761,6 +1014,25 @@ export class AgentManager {
     const promise = runAgent(ctx, type, prompt, {
       pi,
       agentId: id,
+      disposeOnConsume: record.disposeOnConsume,
+      taskAssignment: task?.assignment,
+      onSessionAllocated: (session) => {
+        if (!task) return;
+        record.session = session;
+        task.allocated = true;
+        task.disposition = "retained";
+        task.sessionId = session.sessionId ?? null;
+        record.sessionFile = session.sessionManager?.getSessionFile?.();
+        this.taskConfiguration(ctx, type, options, task.assignment);
+        validateTaskSource(task.assignment);
+        this.attachTaskTranscript(record, prompt, task);
+        this.observeTaskSession(task, session);
+        if (task.effective.model !== task.assignment.configuration.model
+          || task.effective.thinking !== task.assignment.configuration.thinking
+          || task.effective.cwd !== task.assignment.binding.workspace) {
+          throw new Error("Task SDK effective model, thinking or cwd does not match the assignment.");
+        }
+      },
       model: options.model,
       maxTurns: options.maxTurns,
       isolated: options.isolated,
@@ -785,6 +1057,9 @@ export class AgentManager {
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
+      onSessionShutdownError: (error) => {
+        if (record.disposeOnConsume || task) record.sessionCleanupError ??= error;
+      },
       onTurnEnd: options.onTurnEnd,
       onTextDelta: options.onTextDelta,
       onAssistantUsage: (usage) => {
@@ -805,6 +1080,16 @@ export class AgentManager {
       },
       onSessionCreated: (session) => {
         record.session = session;
+        // Programmatic one-shot routes need the same retained transcript as Agent.
+        // Attach before any prompt (including partially constructed SDK sessions),
+        // reusing a caller's existing file and the shared settlement final flush.
+        if ((record.disposeOnConsume || task) && options.outputTranscript && !record.outputCleanup) {
+          if (!record.outputFile) {
+            record.outputFile = createOutputFilePath(task?.assignment.binding.workspace ?? ctx.cwd, id, record.rootSessionId!);
+            writeInitialEntry(record.outputFile, id, prompt, task?.assignment.binding.workspace ?? ctx.cwd);
+          }
+          record.outputCleanup = streamToOutputFile(session, record.outputFile, id, task?.assignment.binding.workspace ?? ctx.cwd);
+        }
         // Capture now, while the session object exists: after eviction this
         // path is the only thing that can reopen the conversation, and an
         // in-memory session reports undefined, which correctly means
@@ -885,7 +1170,7 @@ export class AgentManager {
           // not leave the worktree behind.
           if (options.onBeforeWorktreeCleanup) {
             try {
-              await options.onBeforeWorktreeCleanup(record.worktree.path);
+              await options.onBeforeWorktreeCleanup(worktreeCwd ?? record.worktree.path);
             } catch { /* ignore — never block cleanup */ }
           }
           const wtResult = await cleanupWorktree(pi, baseCwd, record.worktree, options.description);
@@ -904,7 +1189,7 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, true, pool);
+        await this.settleRun(record, true, pool);
         return responseText;
       })
       .catch(async (err) => {
@@ -933,7 +1218,7 @@ export class AgentManager {
 
         this.abortOwnedChildren(id);
 
-        this.settleRun(record, false, pool);
+        await this.settleRun(record, false, pool);
         return "";
       });
 
@@ -965,8 +1250,13 @@ export class AgentManager {
    *   recomputed, so a mid-run change to `maxConcurrentForeground` can't make
    *   the release disagree with the acquire.
    */
-  private settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): void {
-    if (!record.isBackground) record.resultConsumed = true;
+  private async settleRun(record: AgentRecord, guardCallback: boolean, pool: Pool | undefined): Promise<void> {
+    const task = this.taskEvidence.get(record);
+    if (task) await this.settleTask(record, task);
+    else record.runSettled = true;
+    // This path must never await record.promise: it IS that promise's settlement.
+    const consumption = (record.disposeOnConsume ? record.blocking === true : !record.isBackground)
+      ? this.consumeResult(record.id) : undefined;
     if (pool === "background") this.runningBackground--;
     else if (pool === "foreground") this.runningForeground--;
 
@@ -983,6 +1273,7 @@ export class AgentManager {
     // A drain with nothing freed is a no-op anyway, but "no-op" is a claim
     // about reachability, and matching the old condition needs no such claim.
     if (record.isBackground || pool !== undefined) this.drainQueue();
+    await consumption?.catch(() => {}); // Cleanup failure is retained separately, never a successful run status.
   }
 
   /**
@@ -1098,6 +1389,7 @@ export class AgentManager {
     if (record.promise === undefined && record.status === "error") {
       throw new Error(record.error ?? "Agent failed to start");
     }
+    if (record.disposeOnConsume && !record.promise) await this.consumeResult(id).catch(() => {});
     return { id, record };
   }
 
@@ -1111,7 +1403,28 @@ export class AgentManager {
     options?: ResumeOptions,
   ): Promise<AgentRecord | undefined> {
     const record = this.agents.get(id);
-    if (!record?.session) return undefined;
+    if (!record?.session || record.disposeOnConsume) return undefined;
+    const task = this.taskEvidence.get(record);
+    if (!task && options?.taskAssignment !== undefined) throw new Error("Cannot add a TaskAssignment to an ordinary agent on resume.");
+    if (task) {
+      if (!task.settled) throw new Error("Task attempt has not settled; resume is not permitted.");
+      if (options?.taskAssignment === undefined) throw new Error("Task resume requires the unchanged TaskAssignment with a fresh attemptId.");
+      const assignment = snapshotTaskAssignment(options.taskAssignment);
+      if (!sameTaskContract(task.assignment, assignment)) throw new Error("Task resume cannot widen or replace the original contract.");
+      if (task.attempts.has(assignment.attemptId)) throw new Error("Task attemptId must be fresh.");
+      if (task.attempt > task.assignment.maxRemediations) throw new Error("Task remediation limit reached.");
+      this.checkTaskResume(record, task, assignment);
+      task.assignment = assignment;
+      task.attempts.add(assignment.attemptId);
+      task.attempt++;
+      task.settled = false;
+      task.quiescent = null;
+      task.settlementError = null;
+      task.disposition = "retained";
+      task.usageStart = { ...record.lifetimeUsage };
+      record.runSettled = false;
+      record.resultConsumed = false;
+    }
 
     // Background resume: settle asynchronously and notify on completion exactly
     // like a background spawn, returning immediately with the record still
@@ -1137,6 +1450,7 @@ export class AgentManager {
       record.error = undefined;
       record.completedAt = undefined;
       record.status = "queued";
+      if (task && !this.armQueuedAbort(id, signal)) return record;
 
       const start = () => this.startResume(id, record, prompt, signal, options);
       if (occupiesPoolSlot(record) && !this.poolHasRoom("background")) {
@@ -1172,9 +1486,25 @@ export class AgentManager {
     record.completedAt = undefined;
     record.result = undefined;
     record.error = undefined;
+    let detachTaskSignal: (() => void) | undefined;
+    if (task) {
+      this.attachTaskTranscript(record, prompt, task, true);
+      record.abortController = new AbortController();
+      if (signal?.aborted) this.abort(id);
+      else if (signal) {
+        const onAbort = () => this.abort(id);
+        signal.addEventListener("abort", onAbort, { once: true });
+        detachTaskSignal = () => signal.removeEventListener("abort", onAbort);
+      }
+    }
 
+    const run = async () => {
     try {
-      const { text, failure } = await resumeAgent(record.session, prompt, {
+      // Abort events are not replayed for listeners installed by resumeAgent.
+      // A cancelled task attempt still goes through the SDK settlement below.
+      const { text, failure } = task && record.abortController!.signal.aborted
+        ? { text: "", failure: undefined }
+        : await resumeAgent(record.session!, prompt, {
         onToolActivity: (activity) => {
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
@@ -1189,25 +1519,55 @@ export class AgentManager {
           this.onCompact?.(record, info);
           options?.onCompaction?.(info);
         },
-        signal,
+        signal: task ? record.abortController!.signal : signal,
       });
       // Same contract as the spawn path (#144): a failed final turn is an
       // error, not a completion — but the resumed text stays available.
-      record.status = failure ? "error" : "completed";
+      if (!task || record.status !== "stopped") record.status = failure ? "error" : "completed";
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
     } catch (err) {
-      record.status = "error";
+      if (!task || record.status !== "stopped") record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
       record.completedAt = Date.now();
     }
+    detachTaskSignal?.();
 
     // Same contract as the spawn settle paths: children spawned during the
     // resumed turn must not outlive it — nothing else can see or reach them.
     this.abortOwnedChildren(id);
-
+    if (task) {
+      await this.settleTask(record, task);
+      try { record.outputCleanup?.(); } catch { /* transcript failure must not replace the answer */ }
+      record.outputCleanup = undefined;
+      await this.consumeResult(id).catch(() => {});
+    }
+    };
+    const completion = run();
+    if (task) record.promise = completion.then(() => record.result ?? "");
+    await completion;
     return record;
+  }
+
+  private checkTaskResume(record: AgentRecord, task: TaskRunEvidence, assignment = task.assignment): void {
+    assertTaskCheckoutOwnership(task.ctx, assignment.binding.repositoryRoot);
+    this.assertTaskCheckoutIdle(assignment.binding.repositoryRoot, record.id);
+    for (const existing of this.agents.values()) {
+      if (existing === record) continue;
+      const other = this.taskEvidence.get(existing);
+      if (!other) continue;
+      if (other.assignment.taskId === assignment.taskId && other.attempts.has(assignment.attemptId)) {
+        throw new Error("Task attemptId is already recorded by this manager.");
+      }
+    }
+    this.taskConfiguration(task.ctx, record.type, {
+      description: record.description, model: record.session?.model, thinkingLevel: record.session?.thinkingLevel,
+      maxTurns: task.assignment.configuration.maxTurns || undefined, isolated: task.assignment.configuration.isolated,
+      inheritContext: task.assignment.configuration.inheritContext,
+    }, assignment);
+    const current = validateTaskSource(assignment, task.baseline);
+    task.candidate = { fingerprint: current.fingerprint, observedAt: Date.now(), error: null };
   }
 
   /**
@@ -1225,6 +1585,15 @@ export class AgentManager {
     options: ResumeOptions,
   ) {
     if (!record.session) return;
+    const task = this.taskEvidence.get(record);
+    if (task) {
+      try { this.checkTaskResume(record, task); } catch (error) {
+        task.settled = true;
+        record.runSettled = true;
+        throw error;
+      }
+      this.attachTaskTranscript(record, prompt, task, true);
+    }
 
     record.status = "running";
     record.startedAt = Date.now();
@@ -1241,6 +1610,7 @@ export class AgentManager {
     // for a detached one — background spawns omit it for exactly this reason.
     let detachParentSignal: (() => void) | undefined;
     if (parentSignal) {
+      if (task && parentSignal.aborted) this.abort(id);
       const onParentAbort = () => this.abort(id);
       parentSignal.addEventListener("abort", onParentAbort, { once: true });
       detachParentSignal = () => parentSignal.removeEventListener("abort", onParentAbort);
@@ -1250,7 +1620,7 @@ export class AgentManager {
     // After the record is in its running shape, before the run is kicked off.
     try { options.onStarted?.(); } catch { /* ignore caller wiring errors */ }
 
-    const settle = () => {
+    const settle = async () => {
       detachParentSignal?.();
       detachParentSignal = undefined;
       // Final flush of streaming output file
@@ -1260,6 +1630,7 @@ export class AgentManager {
       }
       // Children spawned during the resumed turn must not outlive it.
       this.abortOwnedChildren(id);
+      if (task) await this.settleTask(record, task);
       if (occupiesPoolSlot(record)) this.runningBackground--;
       try { this.onComplete?.(record); } catch { /* ignore completion side-effect errors */ }
       this.drainQueue();
@@ -1282,7 +1653,7 @@ export class AgentManager {
       },
       signal: abortController.signal,
     })
-      .then(({ text, failure }) => {
+      .then(async ({ text, failure }) => {
         // Don't overwrite status if externally stopped via abort().
         if (record.status !== "stopped") {
           // Same contract as the spawn path (#144): a failed final turn is an
@@ -1292,16 +1663,16 @@ export class AgentManager {
         }
         record.result = text;
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return text;
       })
-      .catch((err) => {
+      .catch(async (err) => {
         if (record.status !== "stopped") {
           record.status = "error";
           record.error = err instanceof Error ? err.message : String(err);
         }
         record.completedAt ??= Date.now();
-        settle();
+        await settle();
         return "";
       });
 
@@ -1327,6 +1698,63 @@ export class AgentManager {
       record.pendingSteers.push(message);
     }
     return true;
+  }
+
+  /** Mark consumption synchronously (notification suppression), then await opt-in release. */
+  async consumeResult(id: string): Promise<boolean> {
+    const record = this.agents.get(id);
+    if (!record || record.status === "running" || record.status === "queued" || (record.disposeOnConsume && record.runSettled === false)
+      || this.taskEvidence.get(record)?.settled === false) return false;
+    record.resultConsumed = true;
+    if (record.disposeOnConsume) {
+      await this.releaseSession(record);
+      if (record.sessionCleanupError) throw new Error(record.sessionCleanupError);
+    }
+    return true;
+  }
+
+  private releaseSession(record: AgentRecord): Promise<void> {
+    if (record.sessionRelease) return record.sessionRelease;
+    const session = record.session;
+    const task = this.taskEvidence.get(record);
+    if (task && !session) {
+      if (task.allocated && task.disposition !== "released") {
+        task.disposition = "unconfirmed";
+        record.sessionCleanupError ??= "Allocated SDK session reference is missing; release is not confirmed.";
+      }
+      return Promise.resolve();
+    }
+    if ((record.disposeOnConsume || task) && session?.messages) record.conversation ??= getAgentConversation(session);
+    if (!task) record.session = undefined;
+    if (task) task.disposition = "releasing";
+    record.sessionRelease = (async () => {
+      if (task && session) {
+        try {
+          if (typeof session.waitForIdle !== "function") throw new Error("SDK release has no observable idle barrier.");
+          await session.waitForIdle();
+          task.quiescent = session.isIdle === true && session.isCompacting === false && session.isBashRunning === false;
+          if (!task.quiescent) throw new Error("SDK release refused while agent, compaction or Bash work is active or unobservable.");
+        } catch (error) {
+          task.disposition = "unconfirmed";
+          record.sessionCleanupError = error instanceof Error ? error.message : String(error);
+          return;
+        }
+      }
+      if (task) record.session = undefined;
+      const error = await shutdownChildSession(session, !!task);
+      if (record.disposeOnConsume || task) {
+        record.sessionCleanupError = error ?? record.sessionCleanupError
+          ?? (session && typeof session.dispose !== "function" ? "Child session has no disposal method" : undefined);
+      }
+      if (task && session) {
+        task.quiescent = session.isIdle === true && session.isCompacting === false && session.isBashRunning === false;
+        if (!task.quiescent) record.sessionCleanupError ??= "SDK activity remained after disposal.";
+        task.disposition = record.sessionCleanupError ? "unconfirmed" : "released";
+      }
+    })();
+    this.pendingReleases.add(record.sessionRelease);
+    void record.sessionRelease.then(() => this.pendingReleases.delete(record.sessionRelease!));
+    return record.sessionRelease;
   }
 
   getRecord(id: string): AgentRecord | undefined {
@@ -1415,6 +1843,9 @@ export class AgentManager {
       this.dequeue(q => q.id === id);
       record.status = "stopped";
       record.completedAt = Date.now();
+      record.runSettled = true;
+      const task = this.taskEvidence.get(record);
+      if (task) task.settled = true;
       return true;
     }
 
@@ -1428,10 +1859,8 @@ export class AgentManager {
   /** Dispose a record's session and remove it from the map. */
   private removeRecord(id: string, record: AgentRecord): void {
     this.tombstone(record);
-    const session = record.session;
     // Detached before the shutdown starts, so the record leaves the map at once and
     // nothing can observe a session that is half torn down.
-    record.session = undefined;
     this.agents.delete(id);
     // A failed startup keeps its (rejected) entry so a late awaitStartup still
     // sees it; drop it with the record so the map can't grow unbounded.
@@ -1439,7 +1868,7 @@ export class AgentManager {
     // Fire-and-forget is right here and only here: this runs from the 60s cleanup timer
     // and from `clearCompleted()` on session boundaries, with the process staying alive,
     // so handlers get their full window. The quit path awaits instead — see dispose().
-    void shutdownChildSession(session);
+    void this.releaseSession(record);
   }
 
   /**
@@ -1449,7 +1878,7 @@ export class AgentManager {
    * transcript, so the mention would have nothing to continue from.
    */
   private tombstone(record: AgentRecord): void {
-    if (!record.handle || !record.sessionFile) return;
+    if (record.disposeOnConsume || record.taskAssignment || !record.handle || !record.sessionFile) return;
     this.tombstones.set(record.handle, {
       handle: record.handle,
       alias: record.alias,
@@ -1471,6 +1900,7 @@ export class AgentManager {
     const cutoff = Date.now() - 10 * 60_000;
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      if (record.runSettled === false || (this.taskRetentions.get(record)?.size ?? 0) > 0) continue;
       if ((record.completedAt ?? 0) >= cutoff) continue;
       this.removeRecord(id, record);
     }
@@ -1485,6 +1915,7 @@ export class AgentManager {
   clearCompleted(skipUnconsumed = false): void {
     for (const [id, record] of this.agents) {
       if (record.status === "running" || record.status === "queued") continue;
+      if (record.runSettled === false || (this.taskRetentions.get(record)?.size ?? 0) > 0) continue;
       if (skipUnconsumed && !record.resultConsumed) continue;
       this.removeRecord(id, record);
     }
@@ -1500,7 +1931,7 @@ export class AgentManager {
   /** Whether any agents are still running or queued. */
   hasRunning(): boolean {
     return [...this.agents.values()].some(
-      r => r.status === "running" || r.status === "queued",
+      r => r.status === "running" || r.status === "queued" || (r.taskAssignment !== undefined && r.runSettled === false),
     );
   }
 
@@ -1513,6 +1944,9 @@ export class AgentManager {
       if (record) {
         record.status = "stopped";
         record.completedAt = Date.now();
+        record.runSettled = true;
+        const task = this.taskEvidence.get(record);
+        if (task) task.settled = true;
         count++;
       }
     }
@@ -1537,7 +1971,7 @@ export class AgentManager {
       this.drainQueue();
       const pending: Promise<unknown>[] = [];
       for (const record of this.agents.values()) {
-        if (record.status !== "running" && record.status !== "queued") continue;
+        if (record.status !== "running" && record.status !== "queued" && !(record.taskAssignment && record.runSettled === false)) continue;
         // An agent whose worktree is still being created is "running" with no
         // `promise` yet — without its startup the wait would return too early.
         const startup = this.startups.get(record.id);
@@ -1546,6 +1980,9 @@ export class AgentManager {
       }
       if (pending.length === 0) break;
       await Promise.allSettled(pending);
+      const unconfirmed = [...this.agents.values()].find(record => record.taskAssignment && record.runSettled === false
+        && record.status !== "running" && record.status !== "queued");
+      if (unconfirmed) throw new Error(`Task agent ${unconfirmed.id} SDK settlement is unconfirmed: ${this.taskEvidence.get(unconfirmed)?.settlementError ?? "unknown"}`);
     }
   }
 
@@ -1559,9 +1996,10 @@ export class AgentManager {
     // Clear queue — via dequeue, so anyone blocked in spawnAndWait is woken
     // rather than left awaiting a gate nothing will ever resolve.
     this.dequeue(() => true);
-    const sessions = [...this.agents.values()].map(record => record.session);
-    this.agents.clear();
-    this.startups.clear();
+    const records = [...this.agents.values()];
+    // One-shot sessions must finish actual SDK work before they can be disposed.
+    const oneShot = records.filter(record => record.disposeOnConsume || record.taskAssignment);
+    for (const record of oneShot) this.abort(record.id);
     if (pi) {
       // Prune any orphaned git worktrees (crash recovery). Detached: dispose runs
       // on the shutdown path, which cannot wait for git. Started before the awaited
@@ -1573,9 +2011,18 @@ export class AgentManager {
       // exit with in-flight agents would otherwise leave stale registrations there.
       for (const repo of this.worktreeRepos) prune(repo);
     }
+    if (oneShot.length > 0) {
+      await Promise.allSettled(oneShot.map(async record => {
+        await this.startups.get(record.id)?.catch(() => {});
+        await record.promise;
+      }));
+    }
+    this.agents.clear();
+    this.startups.clear();
     // Awaited, unlike the eviction path: pi awaits this extension's `session_shutdown`
     // handler and the process exits right after it returns, so anything left unawaited
     // here never runs at all. Bounded — each call carries its own ceiling, concurrently.
-    await Promise.all(sessions.map(session => shutdownChildSession(session)));
+    await Promise.all(records.map(record => this.releaseSession(record)));
+    await Promise.all(this.pendingReleases);
   }
 }
