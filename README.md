@@ -535,6 +535,10 @@ Send a steering message to a running agent. The message interrupts after the cur
 | Command | Description |
 |---------|-------------|
 | `/agents` | Interactive agent management menu — agent types, running agents, scheduled jobs, workflow runs, settings |
+| `/direct-task prepare <absolute selector.json>` | Capture actual host bindings and seal a private bridge request; starts no workers and grants no execution authority |
+| `/direct-task run <absolute selector.json>` | Separately requested run under the selected Human approval reference; refuses prepared binding drift and uses the existing Direct workflow |
+
+See [document-backed Direct selection](docs/workflows.md#document-backed-direct-selection) for the required transient selector and private output contract. Command completion exports the full final projection and an observational report without triggering a parent model turn; it never writes the existing task record.
 
 `/agents → Workflows` (shown only when [workflows](#persistent-settings) are on) opens a framed two-pane inspector over a run, with two levels of depth:
 
@@ -994,6 +998,7 @@ src/
   types.ts            # Type definitions (AgentConfig, AgentRecord, etc.)
   task-assignment.ts  # Immutable role contracts and exact Git/source observations
   task-plan.ts        # Opt-in sequential plan, check, review and projection DTOs
+  direct-task.ts      # Transient operator selector and data-only bridge preparation/reporting
 
   # Agent registry
   default-agents.ts   # Embedded default agent configs (general-purpose, Explore, Plan)

@@ -1,4 +1,5 @@
-import { readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type FauxContentBlock, type FauxResponseFactory, fauxAssistantMessage, fauxText, fauxToolCall } from "@earendil-works/pi-ai";
@@ -7,9 +8,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { execCommand } from "../../node_modules/@earendil-works/pi-coding-agent/dist/core/exec.js";
 import { AgentManager } from "../../src/agent-manager.js";
 import { getAgentConfig } from "../../src/agent-types.js";
+import { type DirectTaskSelector } from "../../src/direct-task.js";
 import extension from "../../src/index.js";
 import { captureTaskSource, taskProfileFingerprint } from "../../src/task-assignment.js";
 import { type TaskPlan, type TaskProjection, TaskReviewSchema } from "../../src/task-plan.js";
+import type { WorkflowDialog } from "../../src/ui/workflow-dialog.js";
+import { WorkflowTaskPlan } from "../../src/workflow/task-plan.js";
 import { makePi } from "../helpers/boot-extension.js";
 import { fauxModelBackend } from "../helpers/faux-model-backend.js";
 import { registerFauxProvider } from "../helpers/pi-ai.js";
@@ -169,6 +173,102 @@ describe("saved Direct synthetic integrated qualification", () => {
     expect(edgeCheck.code).toBe(0); // Separate qualification assertion, not an approved workflow check/model call.
     expect(projection.ownership?.state).toBe("released"); protectedUnchanged();
     console.info("Direct synthetic counts: child starts=5; child faux provider calls=12; parent/orchestrator model calls=0; public invocations=1; local checks=6.");
+  }, 30_000);
+
+  it.each(["complete", "cancel"] as const)("native command %s uses actual Manager/SDK/VM and reports the full settled projection exactly once without a parent nudge", async ending => {
+    mode = "recovery";
+    const output = mkdtempSync(join(tmpdir(), "direct-native-")); chmodSync(output, 0o700);
+    const events: string[] = [];
+    const snapshots = vi.spyOn(WorkflowTaskPlan.prototype, "projection");
+    const release = join(output, "release");
+    let dialog: WorkflowDialog | undefined;
+    try {
+      if (ending === "cancel") {
+        const program = join(output, "check.cjs");
+        writeFileSync(program, 'const fs = require("node:fs"); const [ready, stopped, release, settled] = process.argv.slice(2); process.on("SIGTERM", () => { fs.writeFileSync(stopped, "abort received"); const timer = setInterval(() => { if (fs.existsSync(release)) { clearInterval(timer); fs.writeFileSync(settled, "final child effect"); process.exit(0); } }, 10); }); fs.writeFileSync(ready, "running"); setTimeout(() => process.exit(2), 5000);');
+        plan.builder.approvedChecks = [`exec "${process.execPath}" "${program}" "${join(output, "ready")}" "${join(output, "stopped")}" "${release}" "${join(output, "settled")}"`];
+      }
+      boot.pi.sendMessage.mockImplementation(() => { events.push("notification"); });
+      const instructionPath = join(output, "instructions.md"); writeFileSync(instructionPath, instructions);
+      const selectorPath = join(output, "selector.json");
+      const { profileFingerprint: _builderFingerprint, ...builderConfig } = plan.builder.configuration;
+      const { profileFingerprint: _reviewerFingerprint, ...reviewerConfig } = plan.reviewer.configuration;
+      const selector: DirectTaskSelector = { version: 1, taskId: plan.builder.taskId, authorityRef: plan.builder.authorityRef,
+        record: join(fixture.cwd, "AGENTS.md"), instructions: instructionPath, instructionFiles: [], workspace: fixture.cwd,
+        outputDirectory: output, bridgeExecutable: "/usr/bin/true", allowedPaths: plan.builder.allowedPaths,
+        protectedPaths: Object.keys(plan.builder.protectedBaseline), approvedChecks: plan.builder.approvedChecks,
+        evidence: plan.builder.evidence, maxRemediations: 1,
+        builder: { profile: "task-worker", ...builderConfig }, reviewer: { profile: "task-reviewer", ...reviewerConfig } };
+      writeFileSync(selectorPath, JSON.stringify(selector));
+      // Structural bridge transport fixture only. Worker/check execution remains real.
+      const execute = boot.pi.exec.getMockImplementation()!;
+      boot.pi.exec.mockImplementation(async (executable: string, args: string[], options: unknown) => {
+        if (executable !== "/usr/bin/true") {
+          const result = await execute(executable, args, options);
+          if (executable === "sh") events.push("check-settled");
+          return result;
+        }
+        const argument = (key: string) => args[args.indexOf(key) + 1];
+        if (args[2] === "prepare") writeFileSync(argument("--output"), JSON.stringify({ invocation: {
+          scriptPath: argument("--recipe"), taskPlan: JSON.parse(readFileSync(argument("--plan"), "utf-8")), args: { task: readFileSync(argument("--instructions"), "utf-8") },
+        } }), { flag: "wx", mode: 0o600 });
+        else {
+          events.push("report");
+          writeFileSync(argument("--output"), "Synthetic transport report; not CLI qualification", { flag: "wx", mode: 0o600 });
+        }
+        return { code: 0, killed: false, stdout: "", stderr: "" };
+      });
+      await boot.commands.get("direct-task").handler(`prepare ${selectorPath}`, fixture.context);
+      expect(starts).not.toHaveBeenCalled();
+      await boot.commands.get("direct-task").handler(`run ${selectorPath}`, fixture.context);
+      if (ending === "cancel") {
+        await vi.waitFor(() => expect(existsSync(join(output, "ready"))).toBe(true), { timeout: 10_000 });
+        let opened = false;
+        fixture.context.ui.select = vi.fn(async (title: string, options: string[]) => {
+          if (title !== "Agents" || opened) return undefined;
+          opened = true; return options.find(option => /^Workflows \(\d+\)$/.test(option));
+        });
+        fixture.context.ui.custom = vi.fn(async (factory: (...args: unknown[]) => unknown) => {
+          dialog = factory({ requestRender: () => {} }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, {}, () => {}) as WorkflowDialog;
+          return undefined;
+        });
+        await boot.commands.get("agents").handler("", fixture.context);
+        expect(dialog).toBeDefined(); dialog!.handleInput("x"); dialog!.handleInput("x");
+        await vi.waitFor(() => expect(existsSync(join(output, "stopped"))).toBe(true));
+        // SIGTERM was delivered, but the actual exec promise is still owned.
+        expect(events).toEqual([]); expect(existsSync(join(output, "projection.json"))).toBe(false);
+        expect(boot.pi.sendMessage).not.toHaveBeenCalled();
+        expect(boot.pi.exec.mock.calls.filter(call => call[0] === "/usr/bin/true" && call[1][2] === "report")).toHaveLength(0);
+        expect(fixture.context.ui.notify.mock.calls.filter(([text]: [string]) => text.startsWith("Stopped workflow"))).toHaveLength(1);
+        writeFileSync(release, "settle actual exec");
+      }
+      await vi.waitFor(() => expect(boot.pi.sendMessage).toHaveBeenCalledTimes(1), { timeout: 20_000 });
+      const projectionBytes = readFileSync(join(output, "projection.json"));
+      const projection = JSON.parse(projectionBytes.toString("utf-8")) as TaskProjection;
+      expect(projection).toEqual(snapshots.mock.results.at(-1)!.value);
+      expect(projection.ownership).toEqual({ state: "released", error: null });
+      if (ending === "complete") {
+        expect(projection).toMatchObject({ safeStep: "reviewed", review: { verdict: { verdict: "PASS" } } });
+        expect(projection.attempts).toHaveLength(2); expect(starts).toHaveBeenCalledTimes(2);
+      } else {
+        expect(readFileSync(join(output, "settled"), "utf-8")).toBe("final child effect");
+        expect(projection).toMatchObject({ safeStep: "checking", checks: [], candidate: null, review: null });
+        expect(projection.attempts).toHaveLength(1); expect(starts).toHaveBeenCalledTimes(1);
+        expect(projection.attempts[0].receipt).toMatchObject({ execution: { settled: true }, sdk: { allocated: true, quiescent: true, disposition: "retained" } });
+        expect(providerCalls).toBe(2); expect(reviewerTurns).toBe(0);
+        expect(boot.pi.sendMessage.mock.calls[0][0]).toMatchObject({ customType: "direct-task-result", content: expect.stringContaining(": killed.") });
+        expect(events).toEqual(["check-settled", "report", "notification"]);
+        dialog!.handleInput("x");
+        await boot.lifecycle.get("session_shutdown")();
+        await new Promise(resolve => setTimeout(resolve, 250));
+        expect(boot.pi.sendMessage).toHaveBeenCalledTimes(1);
+        expect(readFileSync(join(output, "projection.json"))).toEqual(projectionBytes);
+        expect(events).toEqual(["check-settled", "report", "notification"]);
+      }
+      expect(boot.pi.exec.mock.calls.filter(call => call[0] === "/usr/bin/true" && call[1][2] === "report")).toHaveLength(1);
+      expect(boot.pi.sendMessage.mock.calls[0][1]).toEqual({ triggerTurn: false });
+      expect(projection.plan.builder.instructions).toContain(selectorPath); protectedUnchanged();
+    } finally { dialog?.dispose(); writeFileSync(release, "cleanup gate"); await boot.lifecycle.get("session_shutdown")(); rmSync(output, { recursive: true, force: true }); }
   }, 30_000);
 
   it("shared remediation exhaustion does not reset on fresh Builders", async () => {

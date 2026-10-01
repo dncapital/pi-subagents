@@ -380,6 +380,39 @@ For a known-safe continuation, pass the same TaskPlan, `recoveryCheckpointId` an
 
 Synthetic qualification in `test/e2e/direct-implementation.e2e.test.ts` runs the actual saved file through the registered public tool and worker VM, real Manager/SDK/tool execution and real local checks. Host API/context and model registry/auth are fixture mocks; provider answers are scripted. It measures child starts separately from provider calls; it does not establish actual-provider reliability, staged SDK compatibility or efficiency/billing gains.
 
+### Document-backed Direct selection
+
+`/direct-task prepare /absolute/selector.json` prepares only. `/direct-task run /absolute/selector.json` is the separate explicit operator action under the named existing Human approval. Neither command infers approval from record prose. Both require workflows enabled and the existing workflow tool available; run uses the same Manager/TaskPlan/worker path as `SubagentWorkflow`, not a second executor.
+
+The transient selector is one strict JSON object (unknown fields are refused), with every field explicit:
+
+```json
+{
+  "version": 1,
+  "record": "/records/task.md",
+  "taskId": "TASK-123",
+  "authorityRef": "Human approval reference",
+  "workspace": "/work/retained-repository",
+  "outputDirectory": "/private/direct-task-123",
+  "bridgeExecutable": "/engineering/bin/agent-workspace",
+  "instructions": "/records/task-instructions.md",
+  "instructionFiles": ["/work/retained-repository/AGENTS.md"],
+  "allowedPaths": ["src/limit.ts"],
+  "protectedPaths": ["protected.txt", "never-create.txt"],
+  "approvedChecks": ["npm test"],
+  "evidence": ["local checks and full independent review"],
+  "maxRemediations": 1,
+  "builder": {"profile": "builder", "model": "provider/model", "thinking": "high", "maxTurns": 20, "isolated": false, "inheritContext": false},
+  "reviewer": {"profile": "reviewer", "model": "provider/model", "thinking": "high", "maxTurns": 20, "isolated": false, "inheritContext": false}
+}
+```
+
+Profiles must already exist, be enabled and match the explicit restrictions; exact available models and supported thinking are validated. The host generates source/profile fingerprints and protected entry baselines using its actual helpers. The record, instructions and selector bytes are bound as role instruction files. The recipe is the package-relative existing `direct-implementation.js`; no caller-supplied recipe or fingerprint is accepted. The absolute bridge executable must expose the existing data-only `--json pi-bridge prepare/report` CLI, including its secret and byte-binding checks.
+
+Use canonical absolute non-symlink input paths and an existing owner-only output directory outside assigned source. Inputs/outputs are bounded at 4 MiB. Prepare writes exclusive `plan.json`, `host.json` (parent configuration observation) and `request.json`; run reobserves facts and writes a separate `validation.json`, requiring identical sealed preparation rather than refreshing `request.json`. An exclusive `run.json` prevents replay. Output collisions (including dangling symlinks) refuse before workers; use a fresh directory for a newly approved invocation. Failed preparation/admission may leave private evidence; it is not an automatic retry instruction.
+
+After actual workflow settlement, completion exports the full terminal `projection.json` and calls bridge report to write `report.md` once. Missing projections, export failures, nonzero exits or the 30-second CLI timeout are reported separately from workflow status; they never fabricate evidence, rerun workers or clear unconfirmed ownership. Completion is deterministic, with no parent model nudge. Inspect the ordinary workflow UI for execution details and cancellation. Link evidence into the existing record manually; there is no record/status synchronization, acceptance, merge or publication authority. Ordinary workflow notifications and checkpoint contracts are unchanged.
+
 ### Fan out over a list you don't have yet
 
 > *"audit every route file under src/routes for missing auth checks"*

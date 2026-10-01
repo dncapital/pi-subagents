@@ -24,6 +24,7 @@ import { BUILTIN_TOOL_NAMES, getAgentConfig, getAllTypes, getAvailableTypes, get
 import { inChildSessionContext } from "./child-context.js";
 import { type RpcHandle, registerRpcHandlers } from "./cross-extension-rpc.js";
 import { loadCustomAgents } from "./custom-agents.js";
+import { type DirectTaskReport, reportDirectTask, selectDirectTask } from "./direct-task.js";
 import { GroupJoinManager } from "./group-join.js";
 import { isolationParam, resolveAgentInvocationConfig, resolveJoinMode } from "./invocation-config.js";
 import { describeMention, handleBase, isReservedHandle, parseMention, resolveHandleToType, stripAgentPrefix } from "./mention.js";
@@ -2441,7 +2442,14 @@ Terse command-style prompts produce shallow, generic work.
    * agent uses — held briefly by `scheduleNudge`, delivered as a follow-up that
    * triggers a turn, rendered by the existing `subagent-notification` renderer.
    */
-  function notifyWorkflowFinished(task: WorkflowTask) {
+  async function notifyWorkflowFinished(task: WorkflowTask) {
+    if (task.directTaskReport) {
+      const reporting = await reportDirectTask(pi, task.directTaskReport, task.taskProjection);
+      pi.sendMessage({ customType: "direct-task-result", display: true,
+        content: `Direct workflow ${task.id}: ${task.status}.\n${reporting}` }, { triggerTurn: false });
+      widget.update(); fleet.update();
+      return;
+    }
     widget.update();
     fleet.update();
     const result = workflowResultText(task);
@@ -2559,7 +2567,10 @@ Terse command-style prompts produce shallow, generic work.
       );
     },
 
-    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => {
+    execute: async (toolCallId, params, _signal, _onUpdate, ctx) => launchWorkflow(toolCallId, params, ctx),
+  });
+
+  async function launchWorkflow(toolCallId: string, params: { taskPlan?: unknown; recoveryCheckpointId?: string; resumeFromRunId?: string; script?: string; scriptPath?: string; name?: string; args?: unknown }, ctx: ExtensionContext, report?: DirectTaskReport) {
       if (params.taskPlan !== undefined && params.resumeFromRunId !== undefined) return textResult("Mutable TaskPlan runs refuse resumeFromRunId; use a selected-branch checkpoint.");
       if (params.recoveryCheckpointId !== undefined && params.taskPlan === undefined) return textResult("recoveryCheckpointId requires the declared TaskPlan; no ordinary downgrade.");
       let taskPlan: Immutable<TaskPlan> | undefined;
@@ -2632,6 +2643,7 @@ Terse command-style prompts produce shallow, generic work.
         ...(journalPath !== undefined ? { journalPath } : {}),
         ...(replay !== undefined && replay.length > 0 ? { replay, resumedFrom: resumeFrom!.runId } : {}),
       });
+      if (report) task.directTaskReport = report;
       workflowTasks.set(runId, task);
       // The run's own row has to appear now, not when it settles. Its agents
       // are owned by it, so their lifecycle callbacks no longer refresh these
@@ -2661,6 +2673,30 @@ Terse command-style prompts produce shallow, generic work.
         }],
         details: { taskId: runId },
       };
+  }
+
+  pi.registerCommand("direct-task", {
+    description: "Prepare or explicitly run a document-backed Direct task: prepare|run <absolute selector.json>",
+    handler: async (args, ctx) => {
+      const match = /^(prepare|run) (\/[^\r\n]+)$/.exec(args.trim());
+      if (!match) { ctx.ui.notify("Usage: /direct-task prepare|run <absolute selector.json>", "error"); return; }
+      try {
+        resolveWorkflowCollisions(ctx);
+        if (!isWorkflowsEnabled() || !pi.getActiveTools().includes(SUBAGENT_TOOL_NAMES.WORKFLOW)
+          || pi.getAllTools().some(tool => tool.name === SUBAGENT_TOOL_NAMES.WORKFLOW && tool.description !== workflowTool.description)) throw new Error("Workflow unavailable.");
+        reloadCustomAgents(true);
+        const action = match[1] as "prepare" | "run";
+        const selected = await selectDirectTask(pi, ctx, match[2], action);
+        if (action === "prepare") {
+          ctx.ui.notify(`Prepared: ${selected.report.requestPath}. No execution authority granted. Run is a separate operator action.`, "info");
+          return;
+        }
+        if (!isWorkflowsEnabled() || !pi.getActiveTools().includes(SUBAGENT_TOOL_NAMES.WORKFLOW)
+          || pi.getAllTools().some(tool => tool.name === SUBAGENT_TOOL_NAMES.WORKFLOW && tool.description !== workflowTool.description)) throw new Error("Workflow unavailable.");
+        const result = await launchWorkflow("direct-task", selected.invocation, ctx, selected.report);
+        if (!result.details?.taskId) throw new Error("Workflow admission refused.");
+        ctx.ui.notify(`Direct workflow started: ${result.details.taskId}`, "info");
+      } catch { ctx.ui.notify("Direct task refused: selection, binding, workflow availability or bridge validation failed. No approval inferred.", "error"); }
     },
   });
 

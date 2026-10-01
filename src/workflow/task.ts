@@ -15,6 +15,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { DirectTaskReport } from "../direct-task.js";
 import { immutableSnapshot } from "../task-assignment.js";
 import type { TaskPlan, TaskProjection } from "../task-plan.js";
 import type { AgentReceipt, Immutable } from "../types.js";
@@ -45,6 +46,8 @@ export interface WorkflowTask {
   taskPlan?: Immutable<TaskPlan>;
   recoveryCheckpointId?: string;
   taskProjection?: Immutable<TaskProjection>;
+  /** Observational bridge destination only; no lifecycle or authority ownership. */
+  directTaskReport?: DirectTaskReport;
 
   /**
    * Pause, skip and retry, once the run is up.
