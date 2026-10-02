@@ -32,6 +32,13 @@ describe("lightweight CI policy", () => {
     }
   });
 
+  it("uses current checkout and setup-node actions in every job", () => {
+    for (const job of Object.values(workflow.jobs)) {
+      expect(job.steps.filter(step => step.uses?.startsWith("actions/checkout@")).map(step => step.uses)).toEqual(["actions/checkout@v7"]);
+      expect(job.steps.filter(step => step.uses?.startsWith("actions/setup-node@")).map(step => step.uses)).toEqual(["actions/setup-node@v7"]);
+    }
+  });
+
   it("cancels superseded work and bounds runner cost without token write permission", () => {
     expect(workflow.permissions).toEqual({ contents: "read" });
     expect(workflow.concurrency["cancel-in-progress"]).toBe(true);
@@ -39,7 +46,7 @@ describe("lightweight CI policy", () => {
     expect(workflow.concurrency.group).toContain("github.event.pull_request.number || github.ref");
     for (const job of Object.values(workflow.jobs)) {
       expect(job["timeout-minutes"]).toBe(10);
-      expect(job.steps.find(step => step.uses === "actions/setup-node@v4")?.with?.cache).toBe("npm");
+      expect(job.steps.find(step => step.uses === "actions/setup-node@v7")?.with?.cache).toBe("npm");
     }
   });
 
