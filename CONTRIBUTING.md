@@ -53,6 +53,15 @@ npm run build       # tsc
 All four must pass. `npm run lint:fix` will auto-fix most style issues, and
 `npm run test:e2e` runs the end-to-end suite if your change touches that surface.
 
+CI runs one cached, provider-free baseline lint/typecheck/full-test job for relevant
+pull requests to `master`, not a second push run. Superseded runs are cancelled;
+jobs have a ten-minute limit and tests use two workers. Unrelated paths are filtered
+out, so do not require this path-filtered check for every documentation-only PR
+without adjusting that policy. The floor/latest Pi suites are retained for manual
+`workflow_dispatch` with `compatibility: true`; the latest canary remains advisory.
+Manual dispatch needs the workflow on the default branch. Local validation and an
+active workflow declaration alone do not establish a successful hosted run.
+
 If your change touches a render path or the spawn path, `npm run bench` prints
 absolute timings and `npm run bench:ab -- master` compares them against master.
 Neither is required to pass; both are opt-in, and neither runs in CI.
