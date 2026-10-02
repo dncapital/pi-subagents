@@ -61,6 +61,8 @@ without adjusting that policy. The floor/latest Pi suites are retained for manua
 `workflow_dispatch` with `compatibility: true`; the latest canary remains advisory.
 Manual dispatch needs the workflow on the default branch. Local validation and an
 active workflow declaration alone do not establish a successful hosted run.
+The v7 checkout/setup-node actions run on Node 24 and require Actions Runner
+v2.327.1 or later; the project's lint/typecheck/test runtime remains Node 22.
 
 If your change touches a render path or the spawn path, `npm run bench` prints
 absolute timings and `npm run bench:ab -- master` compares them against master.
