@@ -17,10 +17,11 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // Hoisted: vi.mock's factory is lifted above the imports, so it cannot close
 // over ordinary top-level consts.
-const { buildSessionContext, createAgentSession, inMemory } = vi.hoisted(() => ({
+const { buildSessionContext, createAgentSession, inMemory, loaderReload } = vi.hoisted(() => ({
   buildSessionContext: vi.fn(),
   createAgentSession: vi.fn(),
   inMemory: vi.fn(),
+  loaderReload: vi.fn(),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", async () => {
@@ -29,6 +30,18 @@ vi.mock("@earendil-works/pi-coding-agent", async () => {
     ...actual,
     buildSessionContext,
     createAgentSession,
+    DefaultResourceLoader: class {
+      beforeStart?: () => { systemPrompt: string } | undefined;
+      constructor(readonly options: any) {}
+      async reload() {
+        await loaderReload();
+        for (const factory of this.options.extensionFactories ?? []) {
+          factory({ on: (_event: string, handler: () => { systemPrompt: string } | undefined) => {
+            this.beforeStart = handler;
+          } });
+        }
+      }
+    },
     SessionManager: { ...actual.SessionManager, inMemory },
   };
 });
@@ -44,8 +57,11 @@ const CONVERSATION = [
 
 beforeEach(() => {
   createAgentSession.mockReset();
+  loaderReload.mockReset();
   inMemory.mockReset();
-  inMemory.mockReturnValue({ kind: "in-memory-session-manager" } as any);
+  const messages: unknown[] = [];
+  inMemory.mockReturnValue({ kind: "in-memory-session-manager", messages,
+    appendMessage: vi.fn(message => { messages.push(message); }) });
   buildSessionContext.mockReset();
   buildSessionContext.mockReturnValue({ messages: CONVERSATION, thinkingLevel: "high", model: null } as any);
 });
@@ -98,14 +114,17 @@ function visibleTools(opts: any): any[] {
  * that hides its own tool prompts a model with nothing to call.
  */
 function cloneSession(turn?: (tool: any) => Promise<void> | void) {
+  let systemPrompt = "rebuilt-from-cwd";
   const session = {
-    agent: { state: { systemPrompt: "rebuilt-from-cwd", messages: [] as any[] } },
+    agent: { state: { get systemPrompt() { return systemPrompt; }, messages: [] as any[] } },
     prompt: vi.fn(async () => {}),
     dispose: vi.fn(),
   } as any;
   createAgentSession.mockImplementation(async (opts: any) => {
     const tools = visibleTools(opts);
+    session.agent.state.messages = [...opts.sessionManager.messages];
     session.prompt.mockImplementation(async () => {
+      systemPrompt = opts.resourceLoader?.beforeStart?.()?.systemPrompt ?? systemPrompt;
       // No tool, no tool call: the model can only answer in prose.
       if (tools.length === 0) return;
       await turn?.(tools[0]);
@@ -153,7 +172,7 @@ describe("cloning the conversation", () => {
     await runMentionClone(o);
 
     expect(buildSessionContext).toHaveBeenCalledWith([{ type: "message" }], "leaf-1");
-    expect(createAgentSession.mock.calls[0][0].sessionManager).toEqual({
+    expect(createAgentSession.mock.calls[0][0].sessionManager).toMatchObject({
       kind: "in-memory-session-manager",
     });
   });
@@ -270,7 +289,34 @@ describe("attributing the spawn to the real session", () => {
     await runMentionClone(o);
 
     expect(tool.execute).toHaveBeenCalledTimes(1);
-    expect(tool.execute.mock.calls[0][4]).toBe(o.ctx);
+    expect(tool.execute.mock.calls[0][4].cwd).toBe(o.ctx.cwd);
+    expect(tool.execute.mock.calls[0][4].sessionManager).toBe(o.ctx.sessionManager);
+    expect(tool.execute.mock.calls[0][4].modelRegistry).toBe(o.ctx.modelRegistry);
+  });
+
+  it("preserves the SDK's non-enumerable tool capabilities without snapshotting parent getters", async () => {
+    const tool = agentTool();
+    const ctx = mainCtx();
+    let cwd = "/initial";
+    Object.defineProperty(ctx, "cwd", { get: () => cwd, enumerable: true });
+    const executeTool = vi.fn();
+    const callable = [{ name: "Agent" }];
+    cloneSession(async (cloneTool) => {
+      const cloneCtx = Object.defineProperties({ cwd: "/fork" }, {
+        tools: { get: () => callable },
+        executeTool: { value: executeTool },
+      });
+      await cloneTool.execute("c1", {}, undefined, undefined, cloneCtx);
+      cwd = "/live-parent";
+    });
+
+    expect(await runMentionClone(opts({ ctx, agentTool: tool }))).toEqual({ spawned: true });
+
+    const rebound = tool.execute.mock.calls[0][4];
+    expect(rebound.tools).toBe(callable);
+    expect(rebound.executeTool).toBe(executeTool);
+    expect(rebound.cwd).toBe("/live-parent");
+    expect(ctx).not.toHaveProperty("tools");
   });
 
   it("passes no tool-call id, since the real session issued none", async () => {
@@ -364,6 +410,18 @@ describe("when the clone cannot deliver", () => {
 
     expect(result.spawned).toBe(false);
     expect(result.error).toContain("did not start it");
+  });
+
+  it("retains the rebuilt prompt when the parent has no live prompt", async () => {
+    const session = cloneSession(callsAgent());
+    expect(await runMentionClone(opts({ ctx: mainCtx({ getSystemPrompt: () => "" }) }))).toEqual({ spawned: true });
+    expect(session.agent.state.systemPrompt).toBe("rebuilt-from-cwd");
+  });
+
+  it("reports resource loading failure without creating a clone", async () => {
+    loaderReload.mockRejectedValue(new Error("resource load failed"));
+    expect(await runMentionClone(opts())).toEqual({ spawned: false, error: "resource load failed" });
+    expect(createAgentSession).not.toHaveBeenCalled();
   });
 
   it("returns a thrown error rather than rejecting", async () => {
