@@ -64,9 +64,13 @@
 import type { Model } from "@earendil-works/pi-ai";
 import {
   buildSessionContext,
+  convertToLlm,
   createAgentSession,
+  DefaultResourceLoader,
   type ExtensionContext,
+  getAgentDir,
   SessionManager,
+  SettingsManager,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { runInChildSessionContext } from "./child-context.js";
@@ -125,7 +129,13 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         { ...(params as Record<string, unknown>), run_in_background: true } as typeof params,
         signal,
         onUpdate,
-        ctx,
+        // Keep the clone's SDK-provided tool capabilities (including
+        // non-enumerable getters), but attribute every extension-context field
+        // to the real parent. Spreading would snapshot the parent's live getters.
+        Object.defineProperties({}, {
+          ...Object.getOwnPropertyDescriptors(_cloneCtx),
+          ...Object.getOwnPropertyDescriptors(ctx),
+        }) as typeof _cloneCtx,
       );
     },
   };
@@ -146,12 +156,36 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
     // the settings level instead, which is what a session that never ran
     // `/think` is on anyway. Same shim shape as `modelRuntime` below.
     const thinkingLevel = (ctx as { thinkingLevel?: ThinkingLevel }).thinkingLevel;
-    const created = await runInChildSessionContext(() =>
-      createAgentSession({
+    const systemPrompt = ctx.getSystemPrompt?.();
+    const created = await runInChildSessionContext(async () => {
+      const agentDir = getAgentDir();
+      const settingsManager = SettingsManager.create(ctx.cwd, agentDir);
+      const resourceLoader = new DefaultResourceLoader({
+        cwd: ctx.cwd,
+        agentDir,
+        settingsManager,
+        // Loaded after ordinary extensions: replace the complete prompt for
+        // this turn through the public hook, not readonly transcript state.
+        extensionFactories: [(pi) => {
+          pi.on("before_agent_start", () => systemPrompt ? { systemPrompt } : undefined);
+        }],
+      });
+      await resourceLoader.reload();
+      // Newer SDKs rebuild provider context from the session projection, not
+      // the agent's mutable messages. Seed the resolved history in the clone's
+      // own in-memory manager; the real session remains untouched.
+      const sessionManager = SessionManager.inMemory(ctx.cwd);
+      // Pi's own conversion preserves summary/custom-message semantics while
+      // yielding message entries the public manager API accepts.
+      for (const message of convertToLlm(conversation.messages)) sessionManager.appendMessage(message);
+      return createAgentSession({
+        agentDir,
+        settingsManager,
+        resourceLoader,
         cwd: ctx.cwd,
         // Nothing about the copy is worth persisting, and an in-memory manager
         // is also what keeps the real session untouched.
-        sessionManager: SessionManager.inMemory(ctx.cwd),
+        sessionManager,
         model: ctx.model as Model<never> | undefined,
         ...(thinkingLevel && { thinkingLevel }),
         modelRegistry: ctx.modelRegistry,
@@ -166,20 +200,9 @@ export async function runMentionClone(opts: MentionCloneOptions): Promise<Mentio
         // agent-runner's `tools: sessionTools` beside its nested `customTools`.
         tools: [cloneAgentTool.name],
         customTools: [cloneAgentTool],
-      } as Parameters<typeof createAgentSession>[0]),
-    );
+      } as Parameters<typeof createAgentSession>[0]);
+    });
     session = created.session;
-
-    // The clone rebuilds a system prompt from cwd and agentDir, which is close
-    // but not the live one — extensions contribute to it per turn. Copy the
-    // real thing, so the copy reasons under the instructions the user's model
-    // is actually working under.
-    const systemPrompt = ctx.getSystemPrompt?.();
-    if (systemPrompt) session.agent.state.systemPrompt = systemPrompt;
-
-    // The conversation itself. Pushed rather than assigned so the array the
-    // session was built around stays the one it goes on using.
-    session.agent.state.messages.push(...conversation.messages);
 
     // User text first, reminder after — the order Claude Code's attachment
     // renderer produces, where the reminder trails the message it is about.

@@ -45,6 +45,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import * as piAi from "@earendil-works/pi-ai";
 import {
   type AssistantMessage,
   type Context,
@@ -328,8 +329,20 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
         throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
       }
       const max = options.maxModelCalls ?? 16;
-      const factory: FauxResponseStep = async (context, _opts, state) =>
-        toAssistantMessage(await respond(context, state));
+      // SDK 1.0 providers receive transcript-backed prompt/tool deltas. Keep
+      // the existing scripted responders' convenience view without altering
+      // the actual provider transcript or session. Older SDKs supply it directly.
+      const replay = piAi as unknown as {
+        getCurrentTools?: (messages: Context["messages"]) => NonNullable<Context["tools"]>;
+        getCurrentSystemPrompt?: (messages: Context["messages"]) => string;
+      };
+      const factory: FauxResponseStep = async (context, _opts, state) => {
+        const responderContext = replay.getCurrentTools && replay.getCurrentSystemPrompt
+          ? { ...context, tools: replay.getCurrentTools(context.messages),
+              systemPrompt: replay.getCurrentSystemPrompt(context.messages) }
+          : context;
+        return toAssistantMessage(await respond(responderContext, state));
+      };
       faux.setResponses(Array.from({ length: max }, () => factory));
     }
   }
