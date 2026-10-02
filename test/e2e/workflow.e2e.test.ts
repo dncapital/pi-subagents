@@ -64,8 +64,11 @@ function journalsFor(cwd: string): string[] {
   return found;
 }
 
-/** Everything the faux backend was ever asked, flattened for substring checks. */
-const asText = (context: { messages?: unknown[] }) => JSON.stringify(context.messages ?? []);
+/** Conversation evidence only: system tool declarations contain the very
+ * markers these checks must observe in actual calls/results, not descriptions. */
+const asText = (context: { messages?: unknown[] }) => JSON.stringify(
+  (context.messages ?? []).filter(message => (message as { role?: string }).role !== "system"),
+);
 
 /** Poll until `predicate` holds or the deadline passes. */
 async function waitFor(predicate: () => boolean, timeoutMs = 20_000): Promise<boolean> {
@@ -116,7 +119,7 @@ describe("Workflow end to end", () => {
 
     try {
       // The tool reported a background task rather than an error.
-      expect(asText(run.parentSession as unknown as { messages?: unknown[] })).toContain("Task ID");
+      expect(toolResultsNamed(run.parentSession, "SubagentWorkflow").join("\n")).toContain("Task ID");
 
       // The detached run is still going when the parent turn ends — that is the
       // point of background dispatch — so wait for the children to actually run.
@@ -204,7 +207,7 @@ describe("Workflow end to end", () => {
     });
 
     try {
-      expect(asText(run.parentSession as unknown as { messages?: unknown[] })).toContain("Task ID");
+      expect(toolResultsNamed(run.parentSession, "SubagentWorkflow").join("\n")).toContain("Task ID");
       const sawNested = await waitFor(() =>
         childPrompts.some(prompt => prompt.includes("NESTED-TASK-MARKER")),
       );
@@ -250,7 +253,7 @@ describe("Workflow end to end", () => {
 
     try {
       // The author-facing rejection reaches the model, not a stack trace.
-      expect(asText(run.parentSession as unknown as { messages?: unknown[] })).toContain("PURE LITERAL");
+      expect(toolResultsNamed(run.parentSession, "SubagentWorkflow").join("\n")).toContain("PURE LITERAL");
       // And nothing was spawned for a script that never compiled.
       expect(childPrompts).toHaveLength(0);
     } finally {
