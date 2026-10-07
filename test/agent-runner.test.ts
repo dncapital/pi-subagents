@@ -239,6 +239,61 @@ describe("agent-runner explicit configuration", () => {
     expect(createAgentSession).not.toHaveBeenCalled();
   });
 
+  describe("model-specific effort diagnostics", () => {
+    const deepSeek = {
+      provider: "faux", id: "deepseek-v4-pro", reasoning: true,
+      thinkingLevelMap: { minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+    } as unknown as Model<Api>;
+
+    describe.each(["caller", "profile"] as const)("%s-selected effort", (source) => {
+      it.each(["high", "max"] as const)("lists valid choices before an explicit fresh retry with %s", async (thinkingLevel) => {
+        const profile = makeAgentConfig({ model: "faux/unavailable", ...(source === "profile" && { thinking: "low" }) });
+        vi.mocked(getAgentConfig).mockReturnValueOnce(profile);
+        const context = { ...ctx, model: deepSeek };
+        const { session } = createSession("RETRIED");
+        createAgentSession.mockResolvedValue({ session });
+
+        await expect(runAgent(context, "Explore", "Go", {
+          pi, ...(source === "caller" && { thinkingLevel: "low" as const }),
+        })).rejects.toThrow(
+          'Unsupported thinking level "low" for faux/deepseek-v4-pro. Supported thinking levels: off, high, max. Retry with a fresh agent and an explicit supported thinking level.',
+        );
+        expect(createAgentSession).not.toHaveBeenCalled();
+        expect(sessionManagerCreate).not.toHaveBeenCalled();
+        expect(session.prompt).not.toHaveBeenCalled();
+
+        vi.mocked(getAgentConfig).mockReturnValueOnce(profile);
+        const result = await runAgent(context, "Explore", "Go", { pi, thinkingLevel });
+        expect(result.responseText).toBe("RETRIED");
+        expect(createAgentSession).toHaveBeenCalledTimes(1);
+        expect(createAgentSession.mock.lastCall![0]).toMatchObject({ model: deepSeek, thinkingLevel });
+        expect(session.prompt).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    it("lists only off for a non-reasoning model", async () => {
+      await expect(runAgent(ctx, "Explore", "Go", { pi, model: { ...model, reasoning: false }, thinkingLevel: "low" }))
+        .rejects.toThrow('Unsupported thinking level "low" for faux/reasoner. Supported thinking levels: off. Retry with a fresh agent and an explicit supported thinking level.');
+      expect(createAgentSession).not.toHaveBeenCalled();
+    });
+
+    it("omits off from alternatives when reasoning cannot be disabled", async () => {
+      const cannotDisableThinking = { ...deepSeek, thinkingLevelMap: { ...deepSeek.thinkingLevelMap, off: null } };
+      await expect(runAgent(ctx, "Explore", "Go", { pi, model: cannotDisableThinking, thinkingLevel: "off" }))
+        .rejects.toThrow('Unsupported thinking level "off" for faux/deepseek-v4-pro. Supported thinking levels: high, max. Retry with a fresh agent and an explicit supported thinking level.');
+      expect(createAgentSession).not.toHaveBeenCalled();
+    });
+
+    it("reports none when the resolved model has no supported levels", async () => {
+      const noSupportedLevels = {
+        ...deepSeek, thinkingLevelMap: { ...deepSeek.thinkingLevelMap, off: null, high: null, max: null },
+      };
+      await expect(runAgent(ctx, "Explore", "Go", { pi, model: noSupportedLevels, thinkingLevel: "low" }))
+        .rejects.toThrow('Unsupported thinking level "low" for faux/deepseek-v4-pro. Supported thinking levels: none. Retry with a fresh agent using a different model and an explicit supported thinking level.');
+      expect(createAgentSession).not.toHaveBeenCalled();
+    });
+  });
+
   it("rejects explicit off when the reasoning model cannot disable thinking before session creation", async () => {
     const cannotDisableThinking = { ...model, thinkingLevelMap: { ...model.thinkingLevelMap, off: null } };
     const { session } = createSession("OK");
