@@ -335,6 +335,8 @@ All fields are optional — sensible defaults for everything.
 
 `model` and `thinking` are **defaults**: explicit caller choices override each independently, then profile values apply, then the existing parent/settings fallback. This applies to direct and nested `Agent` calls, workflows (`model`/`effort`), and RPC (`model`/`thinkingLevel`). Unsupported caller choices and selected profile thinking defaults fail visibly rather than silently inheriting or clamping. A model-only override incompatible with profile thinking fails until the caller supplies a supported thinking level. Only when caller and profile thinking are both absent does the existing parent/settings SDK fallback apply.
 
+For a resolved model, unsupported-thinking errors list the model's supported levels, or `none` if no levels are supported. Retry with a fresh agent and an explicit supported thinking level, using a different model if the list is empty. The extension does not retry or clamp the rejected choice automatically.
+
 Permissions and restrictions are unchanged. Frontmatter `max_turns`, `inherit_context`, `run_in_background`, `isolated`, and `isolation` remain locked for `Agent` calls; caller parameters only fill unspecified restriction fields. Tool, extension and nested-delegation boundaries are not broadened.
 
 Resumes preserve their session model/thinking. `Agent({ resume, model/thinking })` is rejected: this path cannot apply configuration changes. Start a fresh agent to change them.

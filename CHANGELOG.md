@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Task checkout exclusion includes ordinary Manager workers and canonical Git roots.** Running, queued, stopped-unsettled and SDK-busy workers in child/sibling or symlinked directories block conflicting Task admission. Distinct worktrees remain distinct; external writers are not contained.
 - **Model and thinking are overridable profile defaults.** Explicit caller choices win independently across Agent, nested delegation, workflows and RPC; tool/permission restrictions remain unchanged. Unsupported explicit effort (including `off` when the selected model cannot disable reasoning) fails before session creation, and resumes reject configuration overrides while preserving recorded model/effort.
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
+- **Unsupported-thinking errors list the resolved model's supported levels.** Callers receive explicit fresh-retry advice without automatic retries or clamping.
 
 ## [0.19.0] - 2026-08-25
 

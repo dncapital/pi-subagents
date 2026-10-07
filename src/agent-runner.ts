@@ -881,9 +881,16 @@ export async function runAgent(
   // Resolve thinking level: explicit option > agent config > undefined (inherit)
   const thinkingLevel = options.resumeSessionFile ? undefined : options.thinkingLevel ?? agentConfig?.thinking;
   // Reject caller choices and selected profile defaults pi would otherwise silently clamp, including unsupported `off`.
-  if (thinkingLevel != null
-    && (!model || !getSupportedThinkingLevels(model).includes(thinkingLevel))) {
-    throw new Error(`Unsupported thinking level "${thinkingLevel}" for ${model ? `${model.provider}/${model.id}` : "an unresolved model"}.`);
+  if (thinkingLevel != null) {
+    const supportedLevels = model ? getSupportedThinkingLevels(model) : undefined;
+    if (!supportedLevels?.includes(thinkingLevel)) {
+      const advice = supportedLevels
+        ? ` Supported thinking levels: ${supportedLevels.join(", ") || "none"}. ${supportedLevels.length
+          ? "Retry with a fresh agent and an explicit supported thinking level."
+          : "Retry with a fresh agent using a different model and an explicit supported thinking level."}`
+        : "";
+      throw new Error(`Unsupported thinking level "${thinkingLevel}" for ${model ? `${model.provider}/${model.id}` : "an unresolved model"}.${advice}`);
+    }
   }
 
   const disallowedSet = agentConfig?.disallowedTools
